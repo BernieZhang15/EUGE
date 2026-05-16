@@ -1,0 +1,40 @@
+{
+  "base_model": "meta-llama/Llama-3.2-1B",
+  "device": "cuda:0",
+  "datasets": ["arc_c", "arc_e", "boolq", "hellaswag", "obqa", "piqa", "siqa", "winogrande"],
+  "single_task_batch": true,
+  "output_dir": "./outputs/llama_3_2_1b",
+  "routing_strategy": "top-k",
+
+  "num_experts": 8,
+  "top_k": 2,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "lora_init": "original",
+
+  "load_balance_loss_coef": 0.001,
+  "discriminative_loss_coef": 0.0,
+  "evidential_sparsity_loss_coef": 0.0,
+  "evidence_calibration_loss_coef": 0.0,
+  "expert_ortho_loss_coef": 0.0,
+
+  "eta": 3.0,
+  "loss_min": 0.15,
+  "loss_max": 3.0,
+  "sparsity_loss_eps": 1e-8,
+
+  "router_init_range": 0.02,
+  "router_bias_init": 0.0,
+  "u_threshold": 0.75,
+  "num_epochs": 2,
+  "batch_size": 8,
+  "gradient_accumulation_steps": 2,
+  "learning_rate": 2e-4,
+  "weight_decay": 0.01,
+  "max_grad_norm": null,
+  "max_length": 512,
+
+  "eval_batch_size": 16,
+  "seeds": [42, 123, 3407]
+}
