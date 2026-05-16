@@ -1,0 +1,9 @@
+torch>=2.3.0
+transformers>=4.42.0
+datasets>=2.18.0
+huggingface_hub>=0.23.0
+accelerate>=0.30.0
+tqdm
+numpy
+packaging
+fire
