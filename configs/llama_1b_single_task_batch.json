@@ -3,7 +3,7 @@
   "device": "cuda:0",
   "datasets": ["arc_c", "arc_e", "boolq", "hellaswag", "obqa", "piqa", "siqa", "winogrande"],
   "single_task_batch": true,
-  "output_dir": "./outputs/llama_3_2_1b",
+  "output_dir": "./outputs/llama_1b",
   "routing_strategy": "top-k",
 
   "num_experts": 8,
