@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 
-from aux_loss import compute_moe_ortho_loss
+from aux_loss import expert_output_orthogonality_loss
 from .config import MixLoraConfig
 from .forward import resolve_expert_forward
 from .lora_linear import LoraLinear
@@ -46,6 +46,10 @@ def _gate_bias_key(layer_idx: int) -> str:
     return f"mixlora.layers.{layer_idx}.mlp.moe_gate.bias"
 
 
+def _loss_free_bias_key(layer_idx: int) -> str:
+    return f"mixlora.layers.{layer_idx}.mlp.moe_gate.loss_free_bias"
+
+
 def _lora_key(layer_idx: int, proj_name: str, expert_idx: int, ab: str) -> str:
     return f"mixlora.layers.{layer_idx}.mlp.{proj_name}.experts.{expert_idx}.{ab}.weight"
 
@@ -65,11 +69,15 @@ class MixLoraSparseMoe(nn.Module):
         self.num_experts_: int = config.num_experts_
         self.topk_: Optional[int] = config.top_k_
         self.routing_strategy_: str = config.routing_strategy_
+        self.inference_mode_: str = config.inference_mode_
         self.u_threshold_: float = config.u_threshold_
-        self.dynmole_top_p_: float = config.dynmole_top_p_
-        self.dynmole_entropy_threshold_: float = config.dynmole_entropy_threshold_
-        self.dynmole_entropy_index_: float = config.dynmole_entropy_index_
+        self.loss_free_bias_update_rate_: float = config.loss_free_bias_update_rate_
         self.expert_ortho_loss_coef_: float = config.expert_ortho_loss_coef_
+        self.register_buffer(
+            "loss_free_bias_",
+            torch.zeros(self.num_experts_, dtype=torch.float32),
+            persistent=True,
+        )
         self.runtime_ = MixLoraRuntimeState()
         self.forward_fn_ = resolve_expert_forward(config.model_type_)
 
@@ -100,6 +108,38 @@ class MixLoraSparseMoe(nn.Module):
     def _apply_routing_result(self, routing_result: RoutingResult) -> torch.Tensor:
         return self.runtime_.apply_routing_result(routing_result)
 
+    def update_loss_free_bias(self, flat_attention_mask: Optional[torch.Tensor]) -> None:
+        if self.routing_strategy_ != "loss-free" or self.loss_free_bias_update_rate_ <= 0.0:
+            return
+
+        selected_experts = self.runtime_.selected_experts
+        if selected_experts is None or selected_experts.numel() == 0:
+            return
+
+        if flat_attention_mask is not None:
+            flat_mask = flat_attention_mask.to(
+                device=selected_experts.device,
+                dtype=torch.bool,
+            )
+            if flat_mask.numel() != selected_experts.shape[0]:
+                raise ValueError(
+                    f"attention_mask has {flat_mask.numel()} tokens, "
+                    f"but selected_experts has {selected_experts.shape[0]} token rows."
+                )
+            selected_experts = selected_experts[flat_mask]
+
+        if selected_experts.numel() == 0:
+            return
+
+        with torch.no_grad():
+            expert_counts = torch.bincount(
+                selected_experts.reshape(-1),
+                minlength=self.num_experts_,
+            ).to(dtype=torch.float32, device=self.loss_free_bias_.device)
+            avg_count = expert_counts.mean()
+            error = avg_count - expert_counts
+            self.loss_free_bias_.add_(self.loss_free_bias_update_rate_ * torch.sign(error))
+
     def _build_expert_token_indices(
         self,
         active_mask: torch.Tensor,
@@ -121,6 +161,7 @@ class MixLoraSparseMoe(nn.Module):
         self.runtime_.reset_for_forward()
 
         router_logits = self._compute_router_logits(hidden_states)
+        inference_mode = "dense" if self.training else self.inference_mode_
         routing_weights = self._apply_routing_result(
             compute_routing(
                 router_logits=router_logits,
@@ -128,15 +169,23 @@ class MixLoraSparseMoe(nn.Module):
                 num_experts=self.num_experts_,
                 top_k=self.topk_,
                 dtype=self.dtype_,
+                loss_free_bias=self.loss_free_bias_,
                 u_threshold=self.u_threshold_,
-                dynmole_top_p=self.dynmole_top_p_,
-                dynmole_entropy_threshold=self.dynmole_entropy_threshold_,
-                dynmole_entropy_index=self.dynmole_entropy_index_,
+                inference_mode=inference_mode,
             )
         )
 
-        expert_token_indices = self._build_expert_token_indices(routing_weights > 0)
-        expert_states = self.forward_fn_(
+        dense_all_experts = (
+            self.routing_strategy_ == "EUGE"
+            and self.runtime_.exploration_coeff is not None
+            and bool(torch.all(self.runtime_.exploration_coeff > 0).item())
+        )
+        expert_token_indices = (
+            []
+            if dense_all_experts
+            else self._build_expert_token_indices(routing_weights > 0)
+        )
+        expert_forward_result = self.forward_fn_(
             base_layer=self.base_layer_,
             get_expert_group=self._get_expert_group,
             num_experts=self.num_experts_,
@@ -145,35 +194,27 @@ class MixLoraSparseMoe(nn.Module):
             expert_token_indices=expert_token_indices,
             hidden_states=hidden_states,
             input_dtype=input_dtype,
+            routing_weights=routing_weights,
+            routing_strategy=self.routing_strategy_,
+            selected_experts=self.runtime_.selected_experts,
+            collect_ortho=self.training and self.expert_ortho_loss_coef_ > 0.0,
+            dense_all_experts=dense_all_experts,
         )
         if self.expert_ortho_loss_coef_ > 0.0:
-            self.runtime_.ortho_loss = compute_moe_ortho_loss(
-                training=self.training,
-                routing_strategy=self.routing_strategy_,
-                coef=self.expert_ortho_loss_coef_,
-                selected_experts=self.runtime_.selected_experts,
-                num_experts=self.num_experts_,
-                dtype=self.dtype_,
-                expert_token_indices=expert_token_indices,
-                routing_weights=routing_weights,
-                expert_states=expert_states,
-                hidden_states=hidden_states,
-            )
-
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=self.dtype_, device=hidden_states.device,
-        )
-        for expert_idx in range(self.num_experts_):
-            top_x = expert_token_indices[expert_idx]
-            if top_x.numel() == 0:
-                continue
-            final_hidden_states.index_add_(
-                0, top_x,
-                (expert_states[expert_idx] * routing_weights[top_x, expert_idx, None]).to(self.dtype_)
-            )
-
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim).to(input_dtype)
+            self.runtime_.ortho_loss = expert_output_orthogonality_loss(
+                expert_forward_result.ortho_outputs,
+                active_mask=expert_forward_result.ortho_active_mask,
+                coef=1.0,
+            ) if (
+                self.training
+                and expert_forward_result.ortho_outputs is not None
+                and expert_forward_result.ortho_active_mask is not None
+            ) else hidden_states.new_zeros(())
+        return expert_forward_result.final_hidden_states.reshape(
+            batch_size,
+            sequence_length,
+            hidden_dim,
+        ).to(input_dtype)
 
 
 def collect_adapter_weights(
@@ -192,6 +233,8 @@ def collect_adapter_weights(
             weights[_gate_key(layer_idx)] = moe_layer.gate_.detach().cpu()
         if moe_layer.gate_bias_ is not None:
             weights[_gate_bias_key(layer_idx)] = moe_layer.gate_bias_.detach().cpu()
+        if moe_layer.routing_strategy_ == "loss-free":
+            weights[_loss_free_bias_key(layer_idx)] = moe_layer.loss_free_bias_.detach().cpu()
         for proj_name, inject in config.target_modules_.items():
             if not inject:
                 continue
@@ -221,6 +264,13 @@ def _inject_mlp_module(
         moe_layer.gate_bias_ = nn.Parameter(
             weights[_gate_bias_key(layer_idx)].to(config.dtype_),
             requires_grad=True,
+        )
+    if _loss_free_bias_key(layer_idx) in weights:
+        moe_layer.loss_free_bias_.copy_(
+            weights[_loss_free_bias_key(layer_idx)].to(
+                device=moe_layer.loss_free_bias_.device,
+                dtype=moe_layer.loss_free_bias_.dtype,
+            )
         )
     if not hasattr(mlp, "mixlora_moes"):
         mlp.mixlora_moes = nn.ModuleDict()

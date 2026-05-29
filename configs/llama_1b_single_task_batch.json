@@ -1,10 +1,11 @@
 {
-  "base_model": "meta-llama/Llama-3.2-1B",
-  "device": "cuda:0",
-  "datasets": ["arc_c", "arc_e", "boolq", "hellaswag", "obqa", "piqa", "siqa", "winogrande"],
+  "base_model": "/home/test/boning/models/Llama-3.2-1B",
   "single_task_batch": true,
+  "device": "cuda:1",
+  "datasets": ["arc_c", "arc_e", "obqa"],
   "output_dir": "./outputs/llama_1b",
-  "routing_strategy": "top-k",
+  "routing_strategy": "EUGE",
+  "inference": "dense",
 
   "num_experts": 8,
   "top_k": 2,
@@ -13,20 +14,26 @@
   "lora_dropout": 0.05,
   "lora_init": "original",
 
-  "load_balance_loss_coef": 0.001,
+  "load_balance_loss_coef": 0.0,
   "discriminative_loss_coef": 0.0,
-  "evidential_sparsity_loss_coef": 0.0,
-  "evidence_calibration_loss_coef": 0.0,
-  "expert_ortho_loss_coef": 0.0,
+  "evidential_sparsity_loss_coef": 0.05,
+  "evidence_calibration_loss_coef": 0.05,
+  "expert_ortho_loss_coef": 0.001,
 
-  "eta": 3.0,
+  "loss_free_bias_update_rate": 0.001,
+  "discriminative_target_magnitude": 0.01,
+  "ortho_target_magnitude": 0.0001,
+  "loss_scale_eps": 1e-12,
+
+  "eta": 4.0,
+  "u_threshold": 0.75,
   "loss_min": 0.15,
   "loss_max": 3.0,
   "sparsity_loss_eps": 1e-8,
 
   "router_init_range": 0.02,
   "router_bias_init": 0.0,
-  "u_threshold": 0.75,
+
   "num_epochs": 2,
   "batch_size": 8,
   "gradient_accumulation_steps": 2,
@@ -36,5 +43,5 @@
   "max_length": 512,
 
   "eval_batch_size": 16,
-  "seeds": [42, 123, 3407]
+  "seeds": [43, 123]
 }

@@ -178,7 +178,8 @@ class LoraConfig(AdapterConfig):
         return config
 
 
-available_routing_strategies = ["top-k", "dynmole", "remoe", "EUGE"]
+available_routing_strategies = ["top-k", "loss-free", "EUGE"]
+available_inference_modes = ["dense", "sparse"]
 
 
 def normalize_routing_strategy(routing_strategy: str) -> str:
@@ -189,13 +190,21 @@ def normalize_routing_strategy(routing_strategy: str) -> str:
     lowered = normalized.lower()
     if lowered == "euge-moe" or lowered == "euge":
         return "EUGE"
-    if lowered == "remoe":
-        return "remoe"
-    if lowered == "dynmole":
-        return "dynmole"
+    if lowered in {"loss-free", "loss_free", "lossfree", "lfb"}:
+        return "loss-free"
     if lowered in {"mixlora", "top-k", "topk"}:
         return "top-k"
     return normalized
+
+
+def normalize_inference_mode(inference_mode: str) -> str:
+    if not isinstance(inference_mode, str):
+        return inference_mode
+
+    normalized = inference_mode.strip().lower()
+    if normalized in {"dense", "sparse"}:
+        return normalized
+    return inference_mode.strip()
 
 
 @dataclass
@@ -208,14 +217,9 @@ class MixLoraConfig(LoraConfig):
     router_init_range_: float = None
     router_bias_init_: float = 0.0
     u_threshold_: float = 0.1
-    dynmole_top_p_: float = 0.75
-    dynmole_entropy_threshold_: float = 0.9
-    dynmole_entropy_index_: float = 1.1
-    dynmole_entropy_loss_coef_: float = 1e-2
-    remoe_reg_init_: float = 1e-8
-    remoe_reg_update_mul_: float = 1.2
-    remoe_target_sparsity_: Optional[float] = None
+    loss_free_bias_update_rate_: float = 1e-3
     routing_strategy_: str = None
+    inference_mode_: str = "dense"
     num_experts_: int = None
 
     top_k_: int = None
@@ -223,6 +227,7 @@ class MixLoraConfig(LoraConfig):
     def check(self) -> "MixLoraConfig":
         super().check()
         self.routing_strategy_ = normalize_routing_strategy(self.routing_strategy_)
+        self.inference_mode_ = normalize_inference_mode(self.inference_mode_)
         assert isinstance(self.load_balance_loss_coef_, float) and self.load_balance_loss_coef_ >= 0
         assert (
             isinstance(self.discriminative_loss_coef_, float)
@@ -238,39 +243,20 @@ class MixLoraConfig(LoraConfig):
         assert isinstance(self.router_bias_init_, float)
         assert isinstance(self.u_threshold_, float) and 0.0 < self.u_threshold_ < 1.0
         assert (
-            isinstance(self.dynmole_top_p_, float)
-            and 0.0 < self.dynmole_top_p_ <= 1.0
-        )
-        assert (
-            isinstance(self.dynmole_entropy_threshold_, float)
-            and self.dynmole_entropy_threshold_ >= 0.0
-        )
-        assert (
-            isinstance(self.dynmole_entropy_index_, float)
-            and self.dynmole_entropy_index_ > 0.0
-        )
-        assert (
-            isinstance(self.dynmole_entropy_loss_coef_, float)
-            and self.dynmole_entropy_loss_coef_ >= 0.0
-        )
-        assert isinstance(self.remoe_reg_init_, float) and self.remoe_reg_init_ >= 0
-        assert (
-            isinstance(self.remoe_reg_update_mul_, float)
-            and self.remoe_reg_update_mul_ > 1.0
+            isinstance(self.loss_free_bias_update_rate_, float)
+            and self.loss_free_bias_update_rate_ >= 0.0
         )
         assert (
             isinstance(self.routing_strategy_, str)
             and self.routing_strategy_ in available_routing_strategies
         )
+        assert (
+            isinstance(self.inference_mode_, str)
+            and self.inference_mode_ in available_inference_modes
+        )
         assert isinstance(self.num_experts_, int) and self.num_experts_ > 0
         assert isinstance(self.top_k_, int) and 0 < self.top_k_ <= self.num_experts_, \
             f"top_k must be in (0, num_experts={self.num_experts_}]"
-        if self.remoe_target_sparsity_ is None:
-            self.remoe_target_sparsity_ = 1.0 - (self.top_k_ / float(self.num_experts_))
-        assert (
-            isinstance(self.remoe_target_sparsity_, float)
-            and 0.0 <= self.remoe_target_sparsity_ < 1.0
-        )
         return self
 
     @staticmethod
@@ -278,6 +264,9 @@ class MixLoraConfig(LoraConfig):
         lora_config = MixLoraConfig(**LoraConfig.from_config(config).__dict__)
         lora_config.routing_strategy_ = normalize_routing_strategy(
             config.get("routing_strategy", None)
+        )
+        lora_config.inference_mode_ = normalize_inference_mode(
+            config.get("inference", "dense")
         )
         assert (
             lora_config.peft_type_ == "MIXLORA"
@@ -309,46 +298,17 @@ class MixLoraConfig(LoraConfig):
             config.get("router_init_range", 0.02),
             "router_init_range",
         )
-        default_router_bias_init = (
-            -0.02 if lora_config.routing_strategy_ == "remoe" else 0.0
-        )
         lora_config.router_bias_init_ = _coerce_float(
-            config.get("router_bias_init", default_router_bias_init),
+            config.get("router_bias_init", 0.0),
             "router_bias_init",
         )
         lora_config.u_threshold_ = _coerce_float(
             config.get("u_threshold", 0.1),
             "u_threshold",
         )
-        lora_config.dynmole_top_p_ = _coerce_float(
-            config.get("dynmole_top_p", 0.75),
-            "dynmole_top_p",
-        )
-        lora_config.dynmole_entropy_threshold_ = _coerce_float(
-            config.get("dynmole_entropy_threshold", 0.9),
-            "dynmole_entropy_threshold",
-        )
-        lora_config.dynmole_entropy_index_ = _coerce_float(
-            config.get("dynmole_entropy_index", 1.1),
-            "dynmole_entropy_index",
-        )
-        lora_config.dynmole_entropy_loss_coef_ = _coerce_float(
-            config.get("dynmole_entropy_loss_coef", 1e-2),
-            "dynmole_entropy_loss_coef",
-        )
-        lora_config.remoe_reg_init_ = _coerce_float(
-            config.get("remoe_reg_init", 1e-8),
-            "remoe_reg_init",
-        )
-        lora_config.remoe_reg_update_mul_ = _coerce_float(
-            config.get("remoe_reg_update_mul", 1.2),
-            "remoe_reg_update_mul",
-        )
-        remoe_target_sparsity = config.get("remoe_target_sparsity")
-        lora_config.remoe_target_sparsity_ = (
-            None
-            if remoe_target_sparsity is None
-            else _coerce_float(remoe_target_sparsity, "remoe_target_sparsity")
+        lora_config.loss_free_bias_update_rate_ = _coerce_float(
+            config.get("loss_free_bias_update_rate", 1e-3),
+            "loss_free_bias_update_rate",
         )
         lora_config.top_k_ = _coerce_int(config.get("top_k", 2), "top_k")
         return lora_config
@@ -357,6 +317,7 @@ class MixLoraConfig(LoraConfig):
         config = super().export()
         config["peft_type"] = "MIXLORA"
         config["routing_strategy"] = self.routing_strategy_
+        config["inference"] = self.inference_mode_
         config["num_experts"] = self.num_experts_
         config["top_k"] = self.top_k_
         config["load_balance_loss_coef"] = self.load_balance_loss_coef_
@@ -367,11 +328,5 @@ class MixLoraConfig(LoraConfig):
         config["router_init_range"] = self.router_init_range_
         config["router_bias_init"] = self.router_bias_init_
         config["u_threshold"] = self.u_threshold_
-        config["dynmole_top_p"] = self.dynmole_top_p_
-        config["dynmole_entropy_threshold"] = self.dynmole_entropy_threshold_
-        config["dynmole_entropy_index"] = self.dynmole_entropy_index_
-        config["dynmole_entropy_loss_coef"] = self.dynmole_entropy_loss_coef_
-        config["remoe_reg_init"] = self.remoe_reg_init_
-        config["remoe_reg_update_mul"] = self.remoe_reg_update_mul_
-        config["remoe_target_sparsity"] = self.remoe_target_sparsity_
+        config["loss_free_bias_update_rate"] = self.loss_free_bias_update_rate_
         return config

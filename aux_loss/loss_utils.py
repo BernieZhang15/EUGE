@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
@@ -12,9 +13,11 @@ def _mean_or_zero(values, device: torch.device) -> torch.Tensor:
         return torch.stack(values).mean()
     return _zero(device)
 
+
 def _empty_router_stats_raw() -> Dict[str, float]:
     return {
-        "active_assignments": 0.0,
+        "active_assignments_0": 0.0,
+        "active_assignments_1e_3": 0.0,
         "total_assignments": 0.0,
         "token_rows": 0.0,
         "uncertainty_sum": 0.0,
@@ -27,9 +30,19 @@ def _empty_router_stats_raw() -> Dict[str, float]:
         "top_evidence_count": 0.0,
         "tail_evidence_sum": 0.0,
         "tail_evidence_count": 0.0,
-        "tail_ratio_sum": 0.0,
-        "tail_ratio_count": 0.0,
     }
+
+
+@dataclass
+class EUGEIntermediates:
+    evidence: torch.Tensor
+    evidence_sum: torch.Tensor
+    evidence_routing: torch.Tensor
+    selected_experts: torch.Tensor
+    uncertainty: torch.Tensor
+    exploration_coeff: torch.Tensor
+    top_evidence: torch.Tensor
+    tail_evidence: torch.Tensor
 
 
 def _truncated_exploration_coeff(
@@ -42,6 +55,46 @@ def _truncated_exploration_coeff(
     """
     scale = uncertainty.new_tensor(1.0 - threshold).clamp(min=eps)
     return ((uncertainty - threshold) / scale).clamp(min=0.0, max=1.0)
+
+
+def build_euge_intermediates(
+    router_logits: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+    u_threshold: float,
+    eps: float = 1e-8,
+) -> EUGEIntermediates:
+    evidence = torch.relu(router_logits.float())
+    selected_experts = torch.topk(evidence.detach(), k=top_k, dim=-1).indices
+
+    evidence_sum = evidence.sum(dim=-1, keepdim=True)
+    evidence_routing = torch.full_like(evidence, 1.0 / float(num_experts))
+    has_evidence = evidence_sum > 0
+    evidence_routing = torch.where(
+        has_evidence,
+        evidence / evidence_sum.clamp(min=eps),
+        evidence_routing,
+    )
+
+    uncertainty = float(num_experts) / (float(num_experts) + evidence_sum + eps)
+    exploration_coeff = _truncated_exploration_coeff(
+        uncertainty,
+        u_threshold,
+        eps,
+    ).detach()
+    top_evidence = evidence.gather(dim=-1, index=selected_experts).sum(dim=-1)
+    tail_evidence = evidence_sum.squeeze(-1) - top_evidence
+
+    return EUGEIntermediates(
+        evidence=evidence,
+        evidence_sum=evidence_sum,
+        evidence_routing=evidence_routing,
+        selected_experts=selected_experts,
+        uncertainty=uncertainty,
+        exploration_coeff=exploration_coeff,
+        top_evidence=top_evidence,
+        tail_evidence=tail_evidence,
+    )
 
 
 def _flatten_router_logits(

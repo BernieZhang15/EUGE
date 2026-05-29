@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from aux_loss import _truncated_exploration_coeff
+from aux_loss.loss_utils import build_euge_intermediates
 
 
 @dataclass
@@ -12,39 +12,17 @@ class RoutingResult:
     routing_weights: torch.Tensor
     selected_experts: Optional[torch.Tensor] = None
     router_probs: Optional[torch.Tensor] = None
-    tsallis_entropy: Optional[torch.Tensor] = None
     uncertainty: Optional[torch.Tensor] = None
     exploration_coeff: Optional[torch.Tensor] = None
     exploration_mask: Optional[torch.Tensor] = None
+    evidence: Optional[torch.Tensor] = None
+    evidence_sum: Optional[torch.Tensor] = None
+    top_evidence: Optional[torch.Tensor] = None
+    tail_evidence: Optional[torch.Tensor] = None
 
 
 def _topk_indices(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     return torch.topk(scores.detach(), top_k, dim=-1).indices
-
-
-def _tsallis_entropy(probs: torch.Tensor, q: float) -> torch.Tensor:
-    probs = probs.float()
-    if abs(q - 1.0) < 1e-6:
-        return -(probs * probs.clamp(min=1e-12).log()).sum(dim=-1)
-    return (1.0 - probs.pow(q).sum(dim=-1)) / (q - 1.0)
-
-
-def _top_p_with_min_k(
-    probs: torch.Tensor,
-    top_p: float,
-    top_k: int,
-) -> torch.Tensor:
-    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
-    cumulative_probs = sorted_probs.cumsum(dim=-1)
-    cumulative_before = cumulative_probs - sorted_probs
-    sorted_mask = cumulative_before < top_p
-    sorted_mask[..., :top_k] = True
-
-    full_mask = torch.zeros_like(sorted_mask)
-    full_mask.scatter_(dim=-1, index=sorted_indices, src=sorted_mask)
-    routing_weights = probs * full_mask.to(dtype=probs.dtype)
-    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    return routing_weights
 
 
 def route_topk(
@@ -52,8 +30,8 @@ def route_topk(
     top_k: int,
     dtype: torch.dtype,
 ) -> RoutingResult:
-    routing_weights = F.softmax(router_logits, dim=-1, dtype=dtype)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    router_probs = F.softmax(router_logits, dim=-1, dtype=dtype)
+    routing_weights, selected_experts = torch.topk(router_probs, top_k, dim=-1)
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
     full_weights = torch.zeros(
@@ -66,43 +44,37 @@ def route_topk(
     return RoutingResult(
         routing_weights=full_weights,
         selected_experts=selected_experts,
+        router_probs=router_probs,
     )
 
 
-def route_remoe(
-    router_logits: torch.Tensor,
-    dtype: torch.dtype,
-) -> RoutingResult:
-    return RoutingResult(
-        routing_weights=F.relu(router_logits).to(dtype),
-    )
-
-
-def route_dynmole(
+def route_loss_free(
     router_logits: torch.Tensor,
     top_k: int,
     dtype: torch.dtype,
-    top_p: float,
-    entropy_threshold: float,
-    entropy_index: float,
+    expert_bias: torch.Tensor,
 ) -> RoutingResult:
-    router_probs = F.softmax(router_logits, dim=-1, dtype=dtype)
-    tsallis_entropy = _tsallis_entropy(router_probs, entropy_index)
-    high_entropy_mask = tsallis_entropy > entropy_threshold
+    router_probs_fp32 = torch.sigmoid(router_logits.float())
+    biased_scores = router_probs_fp32 + expert_bias.to(
+        device=router_probs_fp32.device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    selected_experts = torch.topk(biased_scores, top_k, dim=-1).indices
+    selected_weights = router_probs_fp32.gather(dim=-1, index=selected_experts)
+    selected_weights /= selected_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    selected_weights = selected_weights.to(dtype)
 
-    soft_routing = router_probs
-    top_p_routing = _top_p_with_min_k(router_probs, top_p, top_k)
-    routing_weights = torch.where(
-        high_entropy_mask.unsqueeze(-1),
-        soft_routing,
-        top_p_routing,
+    full_weights = torch.zeros(
+        router_logits.shape[0],
+        router_logits.shape[1],
+        dtype=dtype,
+        device=router_logits.device,
     )
-
+    full_weights.scatter_(1, selected_experts, selected_weights)
     return RoutingResult(
-        routing_weights=routing_weights,
-        selected_experts=_topk_indices(router_probs, top_k),
-        router_probs=router_probs,
-        tsallis_entropy=tsallis_entropy,
+        routing_weights=full_weights,
+        selected_experts=selected_experts,
+        router_probs=router_probs_fp32.to(dtype),
     )
 
 
@@ -112,39 +84,42 @@ def route_euge(
     top_k: int,
     dtype: torch.dtype,
     u_threshold: float,
+    inference_mode: str = "dense",
 ) -> RoutingResult:
-    evidence = F.relu(router_logits)
-    selected_experts = _topk_indices(evidence, top_k)
-
-    evidence_sum = evidence.sum(dim=-1, keepdim=True)
-    evidence_routing = torch.full_like(
-        evidence,
-        1.0 / float(num_experts),
+    intermediates = build_euge_intermediates(
+        router_logits=router_logits,
+        top_k=top_k,
+        num_experts=num_experts,
+        u_threshold=u_threshold,
     )
-    has_evidence = evidence_sum > 0
-    evidence_routing = torch.where(
-        has_evidence,
-        evidence / evidence_sum.clamp(min=1e-8),
-        evidence_routing,
+    dense_routing_weights = (
+        (1.0 - intermediates.exploration_coeff) * intermediates.evidence_routing
+        + intermediates.exploration_coeff * (1.0 / float(num_experts))
     )
-    total_strength = float(num_experts) + evidence_sum
-    uncertainty = float(num_experts) / (total_strength + 1e-8)
-
-    exploration_coeff = _truncated_exploration_coeff(
-        uncertainty,
-        u_threshold,
-    ).detach()
-    routing_weights = (
-        (1.0 - exploration_coeff) * evidence_routing
-        + exploration_coeff * (1.0 / float(num_experts))
-    )
+    if inference_mode == "sparse":
+        selected_weights = dense_routing_weights.gather(
+            dim=-1,
+            index=intermediates.selected_experts,
+        )
+        routing_weights = torch.zeros_like(dense_routing_weights)
+        routing_weights.scatter_(1, intermediates.selected_experts, selected_weights)
+        exploration_coeff = intermediates.exploration_coeff
+        exploration_mask = intermediates.exploration_coeff > 0
+    else:
+        routing_weights = dense_routing_weights
+        exploration_coeff = intermediates.exploration_coeff
+        exploration_mask = intermediates.exploration_coeff > 0
 
     return RoutingResult(
         routing_weights=routing_weights.to(dtype),
-        selected_experts=selected_experts,
-        uncertainty=uncertainty,
+        selected_experts=intermediates.selected_experts,
+        uncertainty=intermediates.uncertainty,
         exploration_coeff=exploration_coeff,
-        exploration_mask=exploration_coeff > 0,
+        exploration_mask=exploration_mask,
+        evidence=intermediates.evidence,
+        evidence_sum=intermediates.evidence_sum,
+        top_evidence=intermediates.top_evidence,
+        tail_evidence=intermediates.tail_evidence,
     )
 
 
@@ -154,21 +129,16 @@ def compute_routing(
     num_experts: int,
     top_k: int,
     dtype: torch.dtype,
+    loss_free_bias: torch.Tensor,
     u_threshold: float,
-    dynmole_top_p: float,
-    dynmole_entropy_threshold: float,
-    dynmole_entropy_index: float,
+    inference_mode: str = "dense",
 ) -> RoutingResult:
-    if strategy == "remoe":
-        return route_remoe(router_logits, dtype)
-    if strategy == "dynmole":
-        return route_dynmole(
+    if strategy == "loss-free":
+        return route_loss_free(
             router_logits=router_logits,
             top_k=top_k,
             dtype=dtype,
-            top_p=dynmole_top_p,
-            entropy_threshold=dynmole_entropy_threshold,
-            entropy_index=dynmole_entropy_index,
+            expert_bias=loss_free_bias,
         )
     if strategy == "EUGE":
         return route_euge(
@@ -177,6 +147,7 @@ def compute_routing(
             top_k=top_k,
             dtype=dtype,
             u_threshold=u_threshold,
+            inference_mode=inference_mode,
         )
     return route_topk(
         router_logits=router_logits,

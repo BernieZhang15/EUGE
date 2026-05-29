@@ -118,15 +118,12 @@ def configure_external_log_levels() -> None:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
-def collect_expert_sparsity_stats(model: torch.nn.Module) -> Dict[str, float]:
-    return collect_expert_sparsity_stats_with_mask(model, attention_mask=None)
-
-
 def collect_expert_sparsity_stats_with_mask(
     model: torch.nn.Module,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
-    active_experts_per_token_values = []
+    active_experts_per_token_0_values = []
+    active_experts_per_token_1e_3_values = []
     routing_sparsity_values = []
     flat_attention_mask = None
     if attention_mask is not None:
@@ -140,32 +137,85 @@ def collect_expert_sparsity_stats_with_mask(
         if routing_weights is None:
             continue
 
-        active_mask = routing_weights > 0
-        num_experts = active_mask.shape[-1]
+        active_mask_0 = routing_weights > 0
+        active_mask_1e_3 = routing_weights > 1e-3
+        num_experts = active_mask_0.shape[-1]
         if flat_attention_mask is not None:
-            if flat_attention_mask.numel() != active_mask.shape[0]:
+            if flat_attention_mask.numel() != active_mask_0.shape[0]:
                 raise ValueError(
                     f"attention_mask has {flat_attention_mask.numel()} tokens, "
-                    f"but routing_weights has {active_mask.shape[0]} tokens."
+                    f"but routing_weights has {active_mask_0.shape[0]} tokens."
                 )
-            active_mask = active_mask[flat_attention_mask.to(device=active_mask.device)]
-        if active_mask.numel() == 0:
+            mask_device = flat_attention_mask.to(device=active_mask_0.device)
+            active_mask_0 = active_mask_0[mask_device]
+            active_mask_1e_3 = active_mask_1e_3[mask_device]
+        if active_mask_0.numel() == 0:
             continue
-        active_experts_per_token = active_mask.float().sum(dim=-1).mean()
+        active_experts_per_token_0 = active_mask_0.float().sum(dim=-1).mean()
+        active_experts_per_token_1e_3 = active_mask_1e_3.float().sum(dim=-1).mean()
 
-        active_experts_per_token_values.append(active_experts_per_token)
-        routing_sparsity_values.append(1.0 - (active_experts_per_token / float(num_experts)))
+        active_experts_per_token_0_values.append(active_experts_per_token_0)
+        active_experts_per_token_1e_3_values.append(active_experts_per_token_1e_3)
+        routing_sparsity_values.append(
+            1.0 - (active_experts_per_token_0 / float(num_experts))
+        )
 
     stats = {}
-    if active_experts_per_token_values:
-        stats["active_experts_per_token"] = float(
-            torch.stack(active_experts_per_token_values).mean().detach().cpu()
+    if active_experts_per_token_0_values:
+        stats["active_experts_per_token_0"] = float(
+            torch.stack(active_experts_per_token_0_values).mean().detach().cpu()
+        )
+    if active_experts_per_token_1e_3_values:
+        stats["active_experts_per_token_1e_3"] = float(
+            torch.stack(active_experts_per_token_1e_3_values).mean().detach().cpu()
         )
     if routing_sparsity_values:
         stats["routing_sparsity"] = float(
             torch.stack(routing_sparsity_values).mean().detach().cpu()
         )
     return stats
+
+
+def collect_layer_expert_usage_with_mask(
+    model: torch.nn.Module,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> List[Dict[str, object]]:
+    flat_attention_mask = None
+    if attention_mask is not None:
+        flat_attention_mask = attention_mask.reshape(-1).to(dtype=torch.bool)
+
+    layer_usage = []
+    for layer_idx, module in enumerate(get_mixlora_moe_modules(model)):
+        runtime = getattr(module, "runtime_", None)
+        if runtime is None:
+            continue
+        routing_weights = runtime.routing_weights
+        if routing_weights is None:
+            continue
+
+        filtered_weights = routing_weights
+        if flat_attention_mask is not None:
+            if flat_attention_mask.numel() != routing_weights.shape[0]:
+                raise ValueError(
+                    f"attention_mask has {flat_attention_mask.numel()} tokens, "
+                    f"but routing_weights has {routing_weights.shape[0]} tokens."
+                )
+            filtered_weights = routing_weights[
+                flat_attention_mask.to(device=routing_weights.device)
+            ]
+        if filtered_weights.numel() == 0:
+            continue
+
+        layer_usage.append(
+            {
+                "layer_index": layer_idx,
+                "num_tokens": int(filtered_weights.shape[0]),
+                "routed_tokens_count": (
+                    (filtered_weights > 0).float().sum(dim=0).detach().cpu().tolist()
+                ),
+            }
+        )
+    return layer_usage
 
 
 def is_package_available(

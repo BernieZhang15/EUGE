@@ -1,9 +1,10 @@
 import argparse
 import copy
+import gc
 import json
 import logging
 import math
-import shutil
+import os
 from typing import Dict, List
 
 import torch
@@ -12,10 +13,6 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer, get_scheduler
 
 from aux_loss import (
-    DYNMOLE_ENTROPY_INDEX,
-    DYNMOLE_ENTROPY_LOSS_COEF,
-    DYNMOLE_LOAD_BALANCE_LOSS_COEF,
-    DYNMOLE_LOSS_TOP_K,
     compute_aux_loss,
     summarize_router_stats,
 )
@@ -26,18 +23,17 @@ from mixlora.config import normalize_routing_strategy, resolve_target_modules
 from mixlora.utils import (
     configure_external_log_levels,
     configure_file_logging,
+    get_mixlora_moe_modules,
     resolve_device,
     resolve_dtype,
 )
 from train_helpers import (
     accumulate_scalar_stats,
-    average_scalar_stats,
     build_experiment_dirname,
-    build_epoch_summary_suffix,
     build_lora_config,
+    build_train_postfix,
     build_seed_output_dir,
     build_task_output_dir,
-    build_train_postfix,
     compute_per_token_label_mask,
     compute_per_token_task_loss,
     optimizer_step,
@@ -55,14 +51,44 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 configure_external_log_levels()
 logger = logging.getLogger(__name__)
 
-_TRAIN_TQDM_NCOLS = 220
+_TRAIN_TQDM_NCOLS = 200
 _TRAIN_TQDM_BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]"
-_TRAIN_POSTFIX_UPDATE_EVERY = 10
 _HAS_LOGGED_TRAINING_CONFIG = False
+
+
+def _cleanup_train_run(train_loader=None) -> None:
+    if train_loader is not None:
+        iterator = getattr(train_loader, "_iterator", None)
+        if iterator is not None:
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+            train_loader._iterator = None
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+        if callable(ipc_collect):
+            ipc_collect()
+
+
+def _flatten_attention_mask_for_tokens(
+    attention_mask: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    return attention_mask.reshape(-1).to(device=device, dtype=torch.bool)
 
 
 def _train_single(cfg: dict) -> Dict:
     global _HAS_LOGGED_TRAINING_CONFIG
+
+    model = None
+    tokenizer = None
+    train_dataset = None
+    train_loader = None
+    optimizer = None
+    scheduler = None
 
     set_seed(cfg.get("seed", 42))
     device = resolve_device(cfg)
@@ -90,373 +116,290 @@ def _train_single(cfg: dict) -> Dict:
         override=cfg.get("target_modules"),
     )
 
-    lora_cfg = build_lora_config(cfg, dtype, target_modules, routing_strategy)
-    lora_cfg.check()
+    try:
+        lora_cfg = build_lora_config(cfg, dtype, target_modules, routing_strategy)
+        lora_cfg.check()
 
-    model = build_mixlora_model(
-        cfg["base_model"],
-        lora_cfg,
-        device,
-        dtype,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"])
-    tokenizer.pad_token = tokenizer.eos_token
-    dataloader_runtime = resolve_dataloader_runtime(cfg, device)
-
-    train_dataset = build_train_dataset(train_datasets, tokenizer, cfg.get("max_length", 512))
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.get("batch_size", 4),
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=dataloader_runtime["num_workers"],
-        pin_memory=dataloader_runtime["pin_memory"],
-        persistent_workers=dataloader_runtime["persistent_workers"],
-        drop_last=False,
-    )
-
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=cfg.get("learning_rate", 2e-4),
-        weight_decay=cfg.get("weight_decay", 0.01),
-    )
-
-    num_epochs = cfg.get("num_epochs", 3)
-    grad_accum = cfg.get("gradient_accumulation_steps", 4)
-    batches_per_epoch = len(train_loader)
-    steps_per_epoch = math.ceil(batches_per_epoch / grad_accum)
-    if steps_per_epoch == 0:
-        raise ValueError(
-            "Not enough batches for one optimizer step. "
-            "Increase dataset size or reduce gradient_accumulation_steps."
+        model = build_mixlora_model(
+            cfg["base_model"],
+            lora_cfg,
+            device,
+            dtype,
         )
-    total_steps = steps_per_epoch * num_epochs
-    scheduler = get_scheduler("constant", optimizer=optimizer)
+        tokenizer = AutoTokenizer.from_pretrained(cfg["base_model"])
+        tokenizer.pad_token = tokenizer.eos_token
+        dataloader_runtime = resolve_dataloader_runtime(cfg, device)
 
-    max_grad_norm = cfg.get("max_grad_norm")
-    loss_runtime = resolve_loss_runtime(cfg, lora_cfg)
-    eval_runtime = resolve_eval_runtime(cfg)
-    load_balance_coef = loss_runtime["load_balance_coef"]
-    discriminative_coef = loss_runtime["discriminative_coef"]
-    evidential_sparsity_coef = loss_runtime["evidential_sparsity_coef"]
-    expert_ortho_coef = loss_runtime["expert_ortho_coef"]
-    sparsity_eps = loss_runtime["sparsity_eps"]
-    evidence_calibration_coef = loss_runtime["evidence_calibration_coef"]
-    evidence_eta = loss_runtime["evidence_eta"]
-    evidence_loss_min = loss_runtime["evidence_loss_min"]
-    evidence_loss_max = loss_runtime["evidence_loss_max"]
-    router_bias_init = loss_runtime["router_bias_init"]
-    u_threshold = loss_runtime["u_threshold"]
-    dynmole_top_p = loss_runtime["dynmole_top_p"]
-    dynmole_entropy_threshold = loss_runtime["dynmole_entropy_threshold"]
-    dynmole_entropy_index = loss_runtime["dynmole_entropy_index"]
-    dynmole_entropy_coef = loss_runtime["dynmole_entropy_loss_coef"]
-    remoe_reg_coef = loss_runtime["remoe_reg_coef"]
-    remoe_reg_update_mul = loss_runtime["remoe_reg_update_mul"]
-    remoe_target_sparsity = loss_runtime["remoe_target_sparsity"]
-    eval_prompt_max_length = eval_runtime["eval_prompt_max_length"]
-    eval_batch_size = eval_runtime["eval_batch_size"]
+        train_dataset = build_train_dataset(train_datasets, tokenizer, cfg.get("max_length", 512))
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.get("batch_size", 4),
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=dataloader_runtime["num_workers"],
+            pin_memory=dataloader_runtime["pin_memory"],
+            persistent_workers=dataloader_runtime["persistent_workers"],
+            drop_last=False,
+        )
 
-    logger.info(
-        f"Training: {num_epochs} epochs | {routing_strategy} | "
-        f"{batches_per_epoch} batches/epoch | "
-        f"{steps_per_epoch} optimizer steps/epoch | "
-        f"{total_steps} total steps"
-    )
-    logger.info(
-        "DataLoader | num_workers: %d | pin_memory: %s | persistent_workers: %s",
-        dataloader_runtime["num_workers"],
-        dataloader_runtime["pin_memory"],
-        dataloader_runtime["persistent_workers"],
-    )
-    if routing_strategy == "remoe" and load_balance_coef > 0.0:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=cfg.get("learning_rate", 2e-4),
+            weight_decay=cfg.get("weight_decay", 0.01),
+        )
+
+        num_epochs = cfg.get("num_epochs", 3)
+        grad_accum = cfg.get("gradient_accumulation_steps", 4)
+        batches_per_epoch = len(train_loader)
+        steps_per_epoch = math.ceil(batches_per_epoch / grad_accum)
+        if steps_per_epoch == 0:
+            raise ValueError(
+                "Not enough batches for one optimizer step. "
+                "Increase dataset size or reduce gradient_accumulation_steps."
+            )
+        total_steps = steps_per_epoch * num_epochs
+        scheduler = get_scheduler("constant", optimizer=optimizer)
+
+        max_grad_norm = cfg.get("max_grad_norm")
+        loss_runtime = resolve_loss_runtime(cfg, lora_cfg)
+        eval_runtime = resolve_eval_runtime(cfg)
+        load_balance_coef = loss_runtime["load_balance_coef"]
+        discriminative_coef = loss_runtime["discriminative_coef"]
+        evidential_sparsity_coef = loss_runtime["evidential_sparsity_coef"]
+        expert_ortho_coef = loss_runtime["expert_ortho_coef"]
+        sparsity_eps = loss_runtime["sparsity_eps"]
+        evidence_calibration_coef = loss_runtime["evidence_calibration_coef"]
+        evidence_eta = loss_runtime["evidence_eta"]
+        evidence_loss_min = loss_runtime["evidence_loss_min"]
+        evidence_loss_max = loss_runtime["evidence_loss_max"]
+        router_bias_init = loss_runtime["router_bias_init"]
+        u_threshold = loss_runtime["u_threshold"]
+        loss_free_bias_update_rate = loss_runtime["loss_free_bias_update_rate"]
+        discriminative_target_magnitude = loss_runtime["discriminative_target_magnitude"]
+        ortho_target_magnitude = loss_runtime["ortho_target_magnitude"]
+        loss_scale_eps = loss_runtime["loss_scale_eps"]
+        eval_prompt_max_length = eval_runtime["eval_prompt_max_length"]
+        eval_batch_size = eval_runtime["eval_batch_size"]
+
         logger.info(
-            "ReMoE uses refined L1 regularization for balancing; "
-            "ignoring load_balance_loss_coef=%.6f",
+            f"Training: {num_epochs} epochs | {routing_strategy} | "
+            f"{batches_per_epoch} batches/epoch | "
+            f"{steps_per_epoch} optimizer steps/epoch | "
+            f"{total_steps} total steps"
+        )
+        logger.info(
+            "DataLoader | num_workers: %d | pin_memory: %s | persistent_workers: %s",
+            dataloader_runtime["num_workers"],
+            dataloader_runtime["pin_memory"],
+            dataloader_runtime["persistent_workers"],
+        )
+        logger.info(f"Base model type: {base_model_config.model_type} | Targets: {target_modules}")
+        logger.info("Scheduler: constant")
+        logger.info(
+            "Router setup | init_range: %.6f | bias_init: %.6f",
+            lora_cfg.router_init_range_,
+            router_bias_init,
+        )
+        logger.info("Inference routing | mode: %s", lora_cfg.inference_mode_)
+        if routing_strategy == "loss-free" and load_balance_coef > 0.0:
+            logger.info(
+                "Loss-Free routing replaces auxiliary load balancing; ignoring load_balance_loss_coef=%.6f",
+                load_balance_coef,
+            )
+            load_balance_coef = 0.0
+        if routing_strategy == "EUGE":
+            logger.info("EUGE | u_threshold: %.4f", u_threshold)
+        if routing_strategy == "loss-free":
+            logger.info(
+                "Loss-Free | bias_update_rate: %.6f",
+                loss_free_bias_update_rate,
+            )
+        logger.info(
+            "Loss coefs | load_balance: %.6f | discriminative: %.6f | evidential_sparsity: %.6f | evidence_calibration: %.6f | ortho: %.6f",
             load_balance_coef,
-        )
-        load_balance_coef = 0.0
-    if routing_strategy == "remoe" and expert_ortho_coef > 0.0:
-        logger.info(
-            "ReMoE does not use expert orthogonality regularization; "
-            "ignoring expert_ortho_loss_coef=%.6f",
+            discriminative_coef,
+            evidential_sparsity_coef,
+            evidence_calibration_coef,
             expert_ortho_coef,
         )
-        expert_ortho_coef = 0.0
-    logger.info(f"Base model type: {base_model_config.model_type} | Targets: {target_modules}")
-    logger.info("Scheduler: constant")
-    logger.info(
-        "Router setup | init_range: %.6f | bias_init: %.6f",
-        lora_cfg.router_init_range_,
-        router_bias_init,
-    )
-    if routing_strategy == "EUGE":
-        logger.info("EUGE | u_threshold: %.4f", u_threshold)
-    if routing_strategy == "dynmole":
-        if discriminative_coef > 0.0:
+        logger.info(
+            "Loss scale init | mode: first_nonzero_raw_loss_global | activates when: discriminative>0 and/or ortho>0 | targets: discriminative=%.2e, ortho=%.2e | eps: %.2e",
+            discriminative_target_magnitude,
+            ortho_target_magnitude,
+            loss_scale_eps,
+        )
+        if evidential_sparsity_coef > 0.0 or evidence_calibration_coef > 0.0:
+            logger.info(f"Evidential sparsity eps: {sparsity_eps:.2e}")
             logger.info(
-                "DynMoLE does not use discriminative routing loss; ignoring discriminative_loss_coef=%.6f",
-                discriminative_coef,
-            )
-            discriminative_coef = 0.0
-        if evidential_sparsity_coef > 0.0:
-            logger.info(
-                "DynMoLE does not use evidential sparsity loss; ignoring evidential_sparsity_loss_coef=%.6f",
-                evidential_sparsity_coef,
-            )
-            evidential_sparsity_coef = 0.0
-        if evidence_calibration_coef > 0.0:
-            logger.info(
-                "DynMoLE does not use evidence calibration loss; ignoring evidence_calibration_loss_coef=%.6f",
+                "Evidence calibration | coef: %.6f | eta: %.6f | clip: [%.4f, %.4f]",
                 evidence_calibration_coef,
+                evidence_eta,
+                evidence_loss_min,
+                evidence_loss_max,
             )
-            evidence_calibration_coef = 0.0
-        if expert_ortho_coef > 0.0:
-            logger.info(
-                "DynMoLE does not use expert orthogonality regularization; ignoring expert_ortho_loss_coef=%.6f",
-                expert_ortho_coef,
+        logger.info(
+            f"Train: {train_datasets} | Eval: {eval_datasets} | "
+            f"Final eval after training"
+        )
+
+        all_eval_results: Dict = {}
+        global_step = 0
+        running_loss = 0.0
+        running_aux_loss = 0.0
+        running_batches = 0
+        loss_scale_state: Dict[str, float] = {}
+
+        for epoch in range(num_epochs):
+            model.train()
+            optimizer.zero_grad()
+            aux_stats: Dict = {}
+            epoch_aux_stats_sum: Dict[str, float] = {}
+            epoch_euge_stats_sum: Dict[str, float] = {}
+            epoch_expert_sparsity_stats_sum: Dict[str, float] = {}
+            step_router_stats_raw: Dict[str, float] = {}
+            accum_count = 0
+            accum_target = grad_accum
+            optimizer_step_count = 0
+
+            pbar = tqdm(
+                train_loader,
+                desc=f"Epoch {epoch + 1}/{num_epochs}",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=False,
+                ncols=_TRAIN_TQDM_NCOLS,
+                bar_format=_TRAIN_TQDM_BAR_FORMAT,
             )
-            expert_ortho_coef = 0.0
-        logger.info(
-            "DynMoLE auxiliary loss uses fixed defaults; ignoring all JSON loss coefficients."
-        )
-        logger.info(
-            "DynMoLE router | top_p: %.4f | entropy_threshold: %.4f | entropy_index: %.4f | entropy_coef: %.6f",
-            dynmole_top_p,
-            dynmole_entropy_threshold,
-            dynmole_entropy_index,
-            dynmole_entropy_coef,
-        )
-        logger.info(
-            "DynMoLE loss | top_k: %d | load_balance: %.6f | entropy_index: %.4f | entropy_coef: %.6f",
-            DYNMOLE_LOSS_TOP_K,
-            DYNMOLE_LOAD_BALANCE_LOSS_COEF,
-            DYNMOLE_ENTROPY_INDEX,
-            DYNMOLE_ENTROPY_LOSS_COEF,
-        )
-    if routing_strategy == "remoe":
-        logger.info(
-            "ReMoE | reg_init: %.6e | reg_update_mul: %.4f | target_sparsity: %.4f",
-            remoe_reg_coef,
-            remoe_reg_update_mul,
-            remoe_target_sparsity,
-        )
-    logger.info(
-        "Loss coefs | load_balance: %.6f | dynmole_entropy: %.6f | remoe_reg: %.6f | discriminative: %.6f | evidential_sparsity: %.6f | evidence_calibration: %.6f | ortho: %.6f",
-        (
-            DYNMOLE_LOAD_BALANCE_LOSS_COEF
-            if routing_strategy == "dynmole"
-            else load_balance_coef
-        ),
-        (
-            DYNMOLE_ENTROPY_LOSS_COEF
-            if routing_strategy == "dynmole"
-            else dynmole_entropy_coef
-        ),
-        remoe_reg_coef,
-        discriminative_coef,
-        evidential_sparsity_coef,
-        evidence_calibration_coef,
-        expert_ortho_coef,
-    )
-    if evidential_sparsity_coef > 0.0 or evidence_calibration_coef > 0.0:
-        logger.info(f"Evidential sparsity eps: {sparsity_eps:.2e}")
-        logger.info(
-            "Evidence calibration | coef: %.6f | eta: %.6f | clip: [%.4f, %.4f]",
-            evidence_calibration_coef,
-            evidence_eta,
-            evidence_loss_min,
-            evidence_loss_max,
-        )
-    logger.info(
-        f"Train: {train_datasets} | Eval: {eval_datasets} | "
-        f"Final eval after training"
-    )
 
-    all_eval_results: Dict = {}
-    global_step = 0
-    running_loss = 0.0
-    running_aux_loss = 0.0
-    running_batches = 0
+            for step, batch in enumerate(pbar):
+                if accum_count == 0:
+                    accum_target = min(grad_accum, batches_per_epoch - step)
 
-    for epoch in range(num_epochs):
-        model.train()
-        optimizer.zero_grad()
-        aux_stats: Dict = {}
-        epoch_aux_stats_sum: Dict[str, float] = {}
-        epoch_euge_stats_sum: Dict[str, float] = {}
-        epoch_expert_sparsity_stats_sum: Dict[str, float] = {}
-        step_router_stats_raw: Dict[str, float] = {}
-        accum_count = 0
-        accum_target = grad_accum
-        optimizer_step_count = 0
-
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{num_epochs}",
-            unit="batch",
-            dynamic_ncols=False,
-            ncols=min(_TRAIN_TQDM_NCOLS, shutil.get_terminal_size((120, 20)).columns),
-            bar_format=_TRAIN_TQDM_BAR_FORMAT,
-        )
-
-        for step, batch in enumerate(pbar):
-            if accum_count == 0:
-                accum_target = min(grad_accum, batches_per_epoch - step)
-
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            task_loss_per_token = None
-            task_valid_mask = None
-            if evidence_calibration_coef > 0.0:
-                task_loss_per_token = compute_per_token_task_loss(outputs.logits, labels)
-                task_valid_mask = compute_per_token_label_mask(labels)
-
-            aux_loss, aux_stats, batch_router_stats_raw = compute_aux_loss(
-                model=model,
-                routing_strategy=routing_strategy,
-                num_experts=lora_cfg.num_experts_,
-                top_k=lora_cfg.top_k_,
-                load_balance_coef=load_balance_coef,
-                discriminative_coef=discriminative_coef,
-                evidential_sparsity_coef=evidential_sparsity_coef,
-                expert_ortho_coef=expert_ortho_coef,
-                remoe_reg_coef=remoe_reg_coef,
-                device=device,
-                attention_mask=attention_mask,
-                sparsity_eps=sparsity_eps,
-                u_threshold=u_threshold,
-                evidence_calibration_coef=evidence_calibration_coef,
-                evidence_eta=evidence_eta,
-                evidence_loss_min=evidence_loss_min,
-                evidence_loss_max=evidence_loss_max,
-                task_valid_mask=task_valid_mask,
-                task_loss_per_token=task_loss_per_token,
-            )
-            accumulate_scalar_stats(step_router_stats_raw, batch_router_stats_raw)
-            if routing_strategy == "remoe":
-                aux_stats["remoe_reg_coef"] = float(remoe_reg_coef)
-            elif routing_strategy == "dynmole":
-                aux_stats["dynmole_entropy_coef"] = float(DYNMOLE_ENTROPY_LOSS_COEF)
-            accumulate_scalar_stats(epoch_aux_stats_sum, aux_stats)
-
-            (loss + aux_loss).div(accum_target).backward()
-            running_loss += loss.item()
-            running_aux_loss += aux_loss.item()
-            running_batches += 1
-            accum_count += 1
-
-            if accum_count == accum_target:
-                optimizer_step(
-                    optimizer,
-                    scheduler,
-                    trainable_params,
-                    max_grad_norm,
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                flat_attention_mask = _flatten_attention_mask_for_tokens(
+                    attention_mask,
+                    device,
                 )
-                global_step += 1
-                accum_count = 0
 
-                euge_stats, expert_sparsity_stats = summarize_router_stats(
-                    step_router_stats_raw
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
+                task_loss_per_token = None
+                task_valid_mask = None
+                if evidence_calibration_coef > 0.0:
+                    task_loss_per_token = compute_per_token_task_loss(outputs.logits, labels)
+                    task_valid_mask = compute_per_token_label_mask(labels)
+
+                aux_loss, aux_stats, batch_router_stats_raw = compute_aux_loss(
+                    model=model,
+                    routing_strategy=routing_strategy,
+                    num_experts=lora_cfg.num_experts_,
+                    top_k=lora_cfg.top_k_,
+                    load_balance_coef=load_balance_coef,
+                    discriminative_coef=discriminative_coef,
+                    evidential_sparsity_coef=evidential_sparsity_coef,
+                    expert_ortho_coef=expert_ortho_coef,
+                    device=device,
+                    attention_mask=attention_mask,
+                    sparsity_eps=sparsity_eps,
+                    u_threshold=u_threshold,
+                    evidence_calibration_coef=evidence_calibration_coef,
+                    evidence_eta=evidence_eta,
+                    evidence_loss_min=evidence_loss_min,
+                    evidence_loss_max=evidence_loss_max,
+                    task_valid_mask=task_valid_mask,
+                    task_loss_per_token=task_loss_per_token,
+                    loss_scale_state=loss_scale_state,
+                    discriminative_target_magnitude=discriminative_target_magnitude,
+                    ortho_target_magnitude=ortho_target_magnitude,
+                    loss_scale_eps=loss_scale_eps,
                 )
-                if routing_strategy == "remoe":
-                    current_sparsity = None
-                    step_total_assignments = step_router_stats_raw.get(
-                        "total_assignments",
-                        0.0,
+                accumulate_scalar_stats(step_router_stats_raw, batch_router_stats_raw)
+                accumulate_scalar_stats(epoch_aux_stats_sum, aux_stats)
+
+                (loss + aux_loss).div(accum_target).backward()
+                running_loss += loss.item()
+                running_aux_loss += aux_loss.item()
+                running_batches += 1
+                accum_count += 1
+
+                if accum_count == accum_target:
+                    optimizer_step(
+                        optimizer,
+                        scheduler,
+                        trainable_params,
+                        max_grad_norm,
                     )
-                    if step_total_assignments > 0.0:
-                        current_sparsity = 1.0 - (
-                            step_router_stats_raw.get("active_assignments", 0.0)
-                            / step_total_assignments
-                        )
-                    if current_sparsity is not None:
-                        if current_sparsity < remoe_target_sparsity:
-                            remoe_reg_coef *= remoe_reg_update_mul
-                        elif current_sparsity > remoe_target_sparsity:
-                            remoe_reg_coef /= remoe_reg_update_mul
-                        remoe_reg_coef = max(remoe_reg_coef, 0.0)
-                        expert_sparsity_stats["routing_sparsity"] = float(current_sparsity)
-                    aux_stats["remoe_reg_coef"] = float(remoe_reg_coef)
-                step_router_stats_raw = {}
-                accumulate_scalar_stats(epoch_euge_stats_sum, euge_stats)
-                accumulate_scalar_stats(
-                    epoch_expert_sparsity_stats_sum,
-                    expert_sparsity_stats,
-                )
-                optimizer_step_count += 1
+                    global_step += 1
+                    accum_count = 0
 
-                if (
-                    optimizer_step_count == 1
-                    or optimizer_step_count % _TRAIN_POSTFIX_UPDATE_EVERY == 0
-                    or (step + 1) == batches_per_epoch
-                ):
+                    if routing_strategy == "loss-free":
+                        for moe_module in get_mixlora_moe_modules(model):
+                            moe_module.update_loss_free_bias(flat_attention_mask)
+
+                    euge_stats, expert_sparsity_stats = summarize_router_stats(
+                        step_router_stats_raw
+                    )
+                    step_router_stats_raw = {}
+                    accumulate_scalar_stats(epoch_euge_stats_sum, euge_stats)
+                    accumulate_scalar_stats(
+                        epoch_expert_sparsity_stats_sum,
+                        expert_sparsity_stats,
+                    )
+                    optimizer_step_count += 1
+
                     pbar.set_postfix(
                         build_train_postfix(
                             loss_value=loss.item(),
                             aux_stats=aux_stats,
                             euge_stats=euge_stats,
                             expert_sparsity_stats=expert_sparsity_stats,
-                        )
+                        ),
+                        refresh=True,
                     )
 
-        pbar.close()
-        avg_loss = running_loss / max(running_batches, 1)
-        avg_aux = running_aux_loss / max(running_batches, 1)
-        avg_aux_stats = average_scalar_stats(epoch_aux_stats_sum, running_batches)
-        avg_euge_stats = average_scalar_stats(epoch_euge_stats_sum, optimizer_step_count)
-        avg_expert_sparsity_stats = average_scalar_stats(
-            epoch_expert_sparsity_stats_sum,
-            optimizer_step_count,
+            pbar.close()
+            running_loss = 0.0
+            running_aux_loss = 0.0
+            running_batches = 0
+
+        final_adapter_dir = None
+
+        logger.info("Running final evaluation (full splits)...")
+        expert_usage_output_dir = os.path.join(output_dir, "final_eval_expert_usage")
+        final_results = run_eval(
+            model,
+            tokenizer,
+            device,
+            datasets=eval_datasets,
+            max_samples=None,
+            output_path=None,
+            prompt_max_length=eval_prompt_max_length,
+            batch_size=eval_batch_size,
+            expert_usage_output_dir=expert_usage_output_dir,
         )
-        extra = build_epoch_summary_suffix(
-            aux_stats=avg_aux_stats,
-            euge_stats=avg_euge_stats if routing_strategy == "EUGE" else {},
-            expert_sparsity_stats=avg_expert_sparsity_stats,
-        )
-        logger.info(
-            f"Epoch {epoch + 1} done | Step {global_step} | "
-            f"Loss {avg_loss:.4f} | Aux {avg_aux:.4f} | "
-            f"LR {scheduler.get_last_lr()[0]:.2e}{extra}"
-        )
-        running_loss = 0.0
-        running_aux_loss = 0.0
-        running_batches = 0
+        all_eval_results["final"] = final_results
+        log_results(final_results, header="Final Eval")
 
-    final_adapter_dir = None
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "eval_all.json"), "w", encoding="utf-8") as f:
+            json.dump(all_eval_results, f, indent=2)
 
-    logger.info("Running final evaluation (full splits)...")
-    final_results = run_eval(
-        model,
-        tokenizer,
-        device,
-        datasets=eval_datasets,
-        max_samples=None,
-        output_path=None,
-        prompt_max_length=eval_prompt_max_length,
-        batch_size=eval_batch_size,
-    )
-    all_eval_results["final"] = final_results
-    log_results(final_results, header="Final Eval")
-
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "eval_all.json"), "w", encoding="utf-8") as f:
-        json.dump(all_eval_results, f, indent=2)
-
-    print_results(final_results)
-    logger.info(f"Done. Outputs saved to {output_dir}")
-    logger.info("Final adapter saving is disabled.")
-    return {
-        "seed": cfg.get("seed", 42),
-        "output_dir": output_dir,
-        "final_adapter_dir": final_adapter_dir,
-        "final_results": final_results,
-    }
+        print_results(final_results)
+        logger.info(f"Done. Outputs saved to {output_dir}")
+        logger.info("Final adapter saving is disabled.")
+        return {
+            "seed": cfg.get("seed", 42),
+            "output_dir": output_dir,
+            "final_adapter_dir": final_adapter_dir,
+            "final_results": final_results,
+        }
+    finally:
+        del model, tokenizer, train_dataset, optimizer, scheduler
+        _cleanup_train_run(train_loader)
+        del train_loader
 
 
 def _run_multi_seed_training(cfg: dict) -> Dict:

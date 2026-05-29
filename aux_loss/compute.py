@@ -1,10 +1,10 @@
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from mixlora.utils import get_mixlora_moe_modules
 
-from .dynmole import DYNMOLE_ENTROPY_LOSS_COEF, dynmole_auxiliary_loss
 from .general import (
     discriminative_routing_loss,
     evidence_calibration_loss,
@@ -17,7 +17,53 @@ from .loss_utils import (
     _flatten_attention_mask,
     _mean_or_zero,
 )
-from .remoe import remoe_regularization_loss
+
+
+def _round_scale_to_power_of_ten(scale: float, eps: float) -> float:
+    if scale <= eps:
+        return 0.0
+    return float(10 ** round(math.log10(scale)))
+
+
+def _resolve_repo_style_loss_scale(
+    target_value: float,
+    raw_loss: torch.Tensor,
+    eps: float,
+) -> float:
+    if target_value == 0.0:
+        return 0.0
+
+    raw_magnitude = float(raw_loss.detach().abs().cpu())
+    if raw_magnitude <= eps:
+        return 0.0
+
+    scale = target_value / raw_magnitude
+    scale = _round_scale_to_power_of_ten(scale, eps)
+    return scale
+
+
+def _maybe_init_loss_scale(
+    state: Optional[Dict[str, float]],
+    scale_key: str,
+    target_value: float,
+    raw_loss: torch.Tensor,
+    eps: float,
+) -> None:
+    if state is None:
+        return
+    if scale_key in state:
+        return
+    if target_value == 0.0:
+        state[scale_key] = 0.0
+        return
+    raw_magnitude = float(raw_loss.detach().abs().cpu())
+    if raw_magnitude <= eps:
+        return
+    state[scale_key] = _resolve_repo_style_loss_scale(
+        target_value=target_value,
+        raw_loss=raw_loss,
+        eps=eps,
+    )
 
 
 def _init_router_stats_accumulator(device) -> Dict[str, torch.Tensor]:
@@ -42,14 +88,19 @@ def summarize_router_stats(
     euge_stats: Dict[str, float] = {}
     expert_sparsity_stats: Dict[str, float] = {}
 
-    active_assignments = raw_stats.get("active_assignments", 0.0)
     total_assignments = raw_stats.get("total_assignments", 0.0)
     token_rows = raw_stats.get("token_rows", 0.0)
     if token_rows > 0.0:
-        expert_sparsity_stats["active_experts_per_token"] = active_assignments / token_rows
+        active_assignments_0 = raw_stats.get("active_assignments_0", 0.0)
+        active_assignments_1e_3 = raw_stats.get("active_assignments_1e_3", 0.0)
+        expert_sparsity_stats["active_experts_per_token_0"] = active_assignments_0 / token_rows
+        expert_sparsity_stats["active_experts_per_token_1e_3"] = (
+            active_assignments_1e_3 / token_rows
+        )
     if total_assignments > 0.0:
+        active_assignments_0 = raw_stats.get("active_assignments_0", 0.0)
         expert_sparsity_stats["routing_sparsity"] = 1.0 - (
-            active_assignments / total_assignments
+            active_assignments_0 / total_assignments
         )
 
     metric_specs = [
@@ -58,7 +109,6 @@ def summarize_router_stats(
         ("exploration_frac", "exploration_active_sum", "exploration_active_count"),
         ("top_evidence", "top_evidence_sum", "top_evidence_count"),
         ("tail_evidence", "tail_evidence_sum", "tail_evidence_count"),
-        ("tail_ratio", "tail_ratio_sum", "tail_ratio_count"),
     ]
     for output_key, sum_key, count_key in metric_specs:
         count = raw_stats.get(count_key, 0.0)
@@ -77,7 +127,6 @@ def compute_aux_loss(
     discriminative_coef: float,
     evidential_sparsity_coef: float,
     expert_ortho_coef: float,
-    remoe_reg_coef: float,
     device: torch.device,
     attention_mask: Optional[torch.Tensor] = None,
     sparsity_eps: float = 1e-8,
@@ -88,6 +137,10 @@ def compute_aux_loss(
     evidence_loss_max: float = 3.0,
     task_valid_mask: Optional[torch.Tensor] = None,
     task_loss_per_token: Optional[torch.Tensor] = None,
+    loss_scale_state: Optional[Dict[str, float]] = None,
+    discriminative_target_magnitude: float = 1e-2,
+    ortho_target_magnitude: float = 1e-4,
+    loss_scale_eps: float = 1e-12,
 ) -> Tuple[torch.Tensor, Dict[str, Any], Dict[str, float]]:
     """
     Compute auxiliary loss.
@@ -102,28 +155,13 @@ def compute_aux_loss(
           + mean_l L_calibration^{(l)}
           + mean_l L_ortho^{(l)}
     """
-    dynmole_fixed_loss_enabled = routing_strategy == "dynmole"
-    load_balance_enabled = load_balance_coef > 0.0 or dynmole_fixed_loss_enabled
-    dynmole_entropy_enabled = dynmole_fixed_loss_enabled
-    remoe_reg_enabled = (
-        routing_strategy == "remoe"
-        and remoe_reg_coef > 0.0
-        and not dynmole_fixed_loss_enabled
-    )
-    discriminative_enabled = discriminative_coef > 0.0 and not dynmole_fixed_loss_enabled
-    evidential_sparsity_enabled = (
-        evidential_sparsity_coef > 0.0 and not dynmole_fixed_loss_enabled
-    )
-    evidence_enabled = evidence_calibration_coef > 0.0 and not dynmole_fixed_loss_enabled
-    ortho_enabled = (
-        expert_ortho_coef > 0.0
-        and routing_strategy != "remoe"
-        and not dynmole_fixed_loss_enabled
-    )
+    load_balance_enabled = load_balance_coef > 0.0
+    discriminative_enabled = discriminative_coef > 0.0
+    evidential_sparsity_enabled = evidential_sparsity_coef > 0.0
+    evidence_enabled = evidence_calibration_coef > 0.0
+    ortho_enabled = expert_ortho_coef > 0.0
     stats_only_mode = not (
         load_balance_enabled
-        or dynmole_entropy_enabled
-        or remoe_reg_enabled
         or discriminative_enabled
         or evidential_sparsity_enabled
         or evidence_enabled
@@ -131,11 +169,11 @@ def compute_aux_loss(
     )
 
     load_balance_losses = []
-    dynmole_entropy_losses = []
-    remoe_reg_losses = []
     discriminative_losses = []
     evidential_sparsity_losses = []
     evidence_losses = []
+    evidence_task_fit_losses = []
+    evidence_seek_losses = []
     ortho_losses = []
     num_moe_layers = 0
     router_stats_raw = _init_router_stats_accumulator(device)
@@ -155,24 +193,31 @@ def compute_aux_loss(
         router_probs = runtime.router_probs
 
         num_moe_layers += 1
-
         if routing_weights is not None:
-            active_mask = _apply_flat_mask(
+            active_mask_0 = _apply_flat_mask(
                 routing_weights > 0,
                 flat_attention_mask,
                 "routing_weights",
             )
-            if active_mask.numel() > 0:
-                router_stats_raw["active_assignments"] += active_mask.float().sum().to(
+            active_mask_1e_3 = _apply_flat_mask(
+                routing_weights > 1e-3,
+                flat_attention_mask,
+                "routing_weights",
+            )
+            if active_mask_0.numel() > 0:
+                router_stats_raw["active_assignments_0"] += active_mask_0.float().sum().to(
+                    dtype=torch.float64
+                )
+                router_stats_raw["active_assignments_1e_3"] += active_mask_1e_3.float().sum().to(
                     dtype=torch.float64
                 )
                 router_stats_raw["total_assignments"] += torch.tensor(
-                    active_mask.numel(),
+                    active_mask_0.numel(),
                     device=device,
                     dtype=torch.float64,
                 )
                 router_stats_raw["token_rows"] += torch.tensor(
-                    active_mask.shape[0],
+                    active_mask_0.shape[0],
                     device=device,
                     dtype=torch.float64,
                 )
@@ -229,24 +274,19 @@ def compute_aux_loss(
                         dtype=torch.float64,
                     )
 
-            selected_experts = runtime.selected_experts
-            if router_logits is not None and selected_experts is not None:
-                evidence = torch.relu(router_logits.float())
-                selected_experts = selected_experts.to(device=evidence.device)
-                top_mask = torch.zeros_like(evidence, dtype=torch.bool)
-                top_mask.scatter_(dim=-1, index=selected_experts, value=True)
-
+            top_evidence_values = runtime.top_evidence
+            tail_evidence_values = runtime.tail_evidence
+            if top_evidence_values is not None and tail_evidence_values is not None:
                 top_evidence = _apply_flat_mask(
-                    (evidence * top_mask.float()).sum(dim=-1),
+                    top_evidence_values.float().reshape(-1),
                     flat_attention_mask,
                     "top_evidence",
                 )
                 tail_evidence = _apply_flat_mask(
-                    (evidence * (~top_mask).float()).sum(dim=-1),
+                    tail_evidence_values.float().reshape(-1),
                     flat_attention_mask,
                     "tail_evidence",
                 )
-                tail_ratio = tail_evidence / (top_evidence + tail_evidence + 1e-8)
 
                 if top_evidence.numel() > 0:
                     router_stats_raw["top_evidence_sum"] += top_evidence.sum().to(
@@ -265,14 +305,6 @@ def compute_aux_loss(
                         device=device,
                         dtype=torch.float64,
                     )
-                    router_stats_raw["tail_ratio_sum"] += tail_ratio.sum().to(
-                        dtype=torch.float64
-                    )
-                    router_stats_raw["tail_ratio_count"] += torch.tensor(
-                        tail_ratio.numel(),
-                        device=device,
-                        dtype=torch.float64,
-                    )
 
         if stats_only_mode:
             continue
@@ -283,42 +315,13 @@ def compute_aux_loss(
                 ortho_losses.append(ortho_loss)
 
         if load_balance_enabled:
-            if routing_strategy == "dynmole":
-                if router_probs is None:
-                    raise RuntimeError(
-                        "DynMoLE auxiliary loss requires router_probs "
-                        "to be available in the MoE runtime state."
-                    )
-                dynmole_load_balance, dynmole_entropy = dynmole_auxiliary_loss(
-                    router_probs=router_probs,
-                    attention_mask=attention_mask,
-                )
-                load_balance_losses.append(dynmole_load_balance)
-                dynmole_entropy_losses.append(dynmole_entropy)
-            else:
-                load_balance_losses.append(
-                    topk_load_balancing_loss(
-                        router_logits=router_logits,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        coef=load_balance_coef,
-                        attention_mask=attention_mask,
-                    )
-                )
-
-        if remoe_reg_enabled:
-            if routing_weights is None:
-                raise RuntimeError(
-                    "remoe_regularization_loss requires routing_weights "
-                    "to be available in the MoE runtime state."
-                )
-            remoe_reg_losses.append(
-                remoe_regularization_loss(
-                    routing_weights=routing_weights,
+            load_balance_losses.append(
+                topk_load_balancing_loss(
+                    router_logits=router_logits,
                     num_experts=num_experts,
                     top_k=top_k,
-                    coef=remoe_reg_coef,
-                    attention_mask=attention_mask,
+                    coef=1.0,
+                    flat_attention_mask=flat_attention_mask,
                 )
             )
 
@@ -328,11 +331,19 @@ def compute_aux_loss(
                     "discriminative_loss requires routing_weights to be available "
                     "in the MoE runtime state."
                 )
+            dense_router_scores = None
+            if routing_strategy == "top-k":
+                dense_router_scores = (
+                    router_probs.float()
+                    if router_probs is not None
+                    else torch.softmax(router_logits.float(), dim=-1)
+                )
             discriminative_losses.append(
                 discriminative_routing_loss(
                     routing_weights=routing_weights,
-                    coef=discriminative_coef,
-                    attention_mask=attention_mask,
+                    router_scores=dense_router_scores,
+                    coef=1.0,
+                    flat_attention_mask=flat_attention_mask,
                 )
             )
 
@@ -345,11 +356,18 @@ def compute_aux_loss(
                     lambda_sparse=evidential_sparsity_coef,
                     attention_mask=attention_mask,
                     eps=sparsity_eps,
+                    evidence=getattr(runtime, "evidence", None),
+                    selected_experts=getattr(runtime, "selected_experts", None),
+                    exploration_coeff=getattr(runtime, "exploration_coeff", None),
                 )
             )
 
         if evidence_enabled:
-            evidence_loss = evidence_calibration_loss(
+            (
+                evidence_loss,
+                evidence_task_fit_loss,
+                evidence_seek_loss,
+            ) = evidence_calibration_loss(
                 router_logits=router_logits,
                 top_k=top_k,
                 u_threshold=u_threshold,
@@ -361,20 +379,69 @@ def compute_aux_loss(
                 task_loss_per_token=task_loss_per_token,
                 loss_min=evidence_loss_min,
                 loss_max=evidence_loss_max,
+                evidence=getattr(runtime, "evidence", None),
+                top_evidence=getattr(runtime, "top_evidence", None),
+                tail_evidence=getattr(runtime, "tail_evidence", None),
+                exploration_coeff=getattr(runtime, "exploration_coeff", None),
             )
             evidence_losses.append(evidence_loss)
+            evidence_task_fit_losses.append(evidence_task_fit_loss)
+            evidence_seek_losses.append(evidence_seek_loss)
 
-    ortho_loss = _mean_or_zero(ortho_losses, device)
-    load_balance_loss = _mean_or_zero(load_balance_losses, device)
-    dynmole_entropy_loss_value = _mean_or_zero(dynmole_entropy_losses, device)
-    remoe_reg_loss = _mean_or_zero(remoe_reg_losses, device)
-    discriminative_loss_value = _mean_or_zero(discriminative_losses, device)
+    ortho_loss_raw = _mean_or_zero(ortho_losses, device)
+    load_balance_loss_raw = _mean_or_zero(load_balance_losses, device)
+    discriminative_loss_raw = _mean_or_zero(discriminative_losses, device)
     evidential_sparsity_loss_value = _mean_or_zero(evidential_sparsity_losses, device)
     evidence_calibration = _mean_or_zero(evidence_losses, device)
+    evidence_calibration_task_fit = _mean_or_zero(evidence_task_fit_losses, device)
+    evidence_calibration_seek = _mean_or_zero(evidence_seek_losses, device)
+
+    load_balance_loss = load_balance_coef * load_balance_loss_raw
+    discriminative_internal_scale = 1.0
+    ortho_internal_scale = 1.0
+    discriminative_loss_aligned = discriminative_loss_raw
+    ortho_loss_aligned = ortho_loss_raw
+
+    if loss_scale_state is not None:
+        if discriminative_coef > 0.0:
+            _maybe_init_loss_scale(
+                state=loss_scale_state,
+                scale_key="discriminative_internal_scale",
+                target_value=discriminative_target_magnitude,
+                raw_loss=discriminative_loss_raw,
+                eps=loss_scale_eps,
+            )
+        if expert_ortho_coef > 0.0:
+            _maybe_init_loss_scale(
+                state=loss_scale_state,
+                scale_key="ortho_internal_scale",
+                target_value=ortho_target_magnitude,
+                raw_loss=ortho_loss_raw,
+                eps=loss_scale_eps,
+            )
+
+    use_loss_scale = (
+        loss_scale_state is not None
+        and (discriminative_coef > 0.0 or expert_ortho_coef > 0.0)
+    )
+    if use_loss_scale:
+        discriminative_internal_scale = float(
+            loss_scale_state.get("discriminative_internal_scale", 1.0)
+            if discriminative_coef > 0.0
+            else 1.0
+        )
+        ortho_internal_scale = float(
+            loss_scale_state.get("ortho_internal_scale", 1.0)
+            if expert_ortho_coef > 0.0
+            else 1.0
+        )
+        discriminative_loss_aligned = discriminative_loss_raw * discriminative_internal_scale
+        ortho_loss_aligned = ortho_loss_raw * ortho_internal_scale
+
+    discriminative_loss_value = discriminative_coef * discriminative_loss_aligned
+    ortho_loss = expert_ortho_coef * ortho_loss_aligned
     aux_loss = (
         load_balance_loss
-        + dynmole_entropy_loss_value
-        + remoe_reg_loss
         + discriminative_loss_value
         + evidential_sparsity_loss_value
         + evidence_calibration
@@ -384,19 +451,30 @@ def compute_aux_loss(
     stats = {
         "aux_loss": float(aux_loss.detach().cpu()),
         "load_balance_loss": float(load_balance_loss.detach().cpu()),
-        "dynmole_entropy_loss": float(dynmole_entropy_loss_value.detach().cpu()),
-        "remoe_reg_loss": float(remoe_reg_loss.detach().cpu()),
+        "load_balance_loss_raw": float(load_balance_loss_raw.detach().cpu()),
         "discriminative_loss": float(discriminative_loss_value.detach().cpu()),
+        "discriminative_loss_raw": float(discriminative_loss_raw.detach().cpu()),
+        "discriminative_loss_aligned": float(discriminative_loss_aligned.detach().cpu()),
+        "discriminative_internal_scale": float(discriminative_internal_scale),
+        "discriminative_coef": float(discriminative_coef),
+        "discriminative_target_magnitude": float(discriminative_target_magnitude),
         "evidential_sparsity_loss": float(
             evidential_sparsity_loss_value.detach().cpu()
         ),
         "evidence_calibration_loss": float(evidence_calibration.detach().cpu()),
+        "evidence_calibration_task_fit_loss": float(
+            evidence_calibration_task_fit.detach().cpu()
+        ),
+        "evidence_calibration_seek_loss": float(
+            evidence_calibration_seek.detach().cpu()
+        ),
         "ortho_loss": float(ortho_loss.detach().cpu()),
+        "ortho_loss_raw": float(ortho_loss_raw.detach().cpu()),
+        "ortho_loss_aligned": float(ortho_loss_aligned.detach().cpu()),
+        "ortho_internal_scale": float(ortho_internal_scale),
+        "expert_ortho_coef": float(expert_ortho_coef),
+        "ortho_target_magnitude": float(ortho_target_magnitude),
         "num_moe_layers": num_moe_layers,
     }
-    if remoe_reg_enabled:
-        stats["remoe_reg_coef"] = float(remoe_reg_coef)
-    if dynmole_entropy_enabled:
-        stats["dynmole_entropy_coef"] = float(DYNMOLE_ENTROPY_LOSS_COEF)
 
     return aux_loss, stats, _finalize_router_stats(router_stats_raw)

@@ -14,11 +14,21 @@ from mixlora.config import MixLoraConfig
 
 _POSTFIX_AUX_SPECS = [
     ("load_balance_loss", "load_bal", "{:.2e}", lambda value: value > 0.0),
-    ("dynmole_entropy_loss", "dent", "{:.2e}", lambda value: value > 0.0),
-    ("remoe_reg_loss", "rreg", "{:.2e}", lambda value: value > 0.0),
     ("discriminative_loss", "disc", "{:.2e}", lambda value: value != 0.0),
     ("evidential_sparsity_loss", "spar", "{:.2e}", lambda value: value > 0.0),
     ("evidence_calibration_loss", "cal", "{:.2e}", lambda value: value > 0.0),
+    (
+        "evidence_calibration_task_fit_loss",
+        "cal_fit",
+        "{:.2e}",
+        lambda value: value > 0.0,
+    ),
+    (
+        "evidence_calibration_seek_loss",
+        "cal_seek",
+        "{:.2e}",
+        lambda value: value > 0.0,
+    ),
     ("ortho_loss", "ortho", "{:.2e}", lambda value: value > 0.0),
 ]
 
@@ -28,16 +38,25 @@ _POSTFIX_EUGE_SPECS = [
     ("exploration_frac", "exp", "{:.3f}"),
     ("top_evidence", "etop", "{:.3f}"),
     ("tail_evidence", "etail", "{:.3f}"),
-    ("tail_ratio", "tailr", "{:.3f}"),
 ]
 
 _EPOCH_AUX_SPECS = [
     ("load_balance_loss", "load_bal", "{:.3e}", lambda value: value > 0.0),
-    ("dynmole_entropy_loss", "dent", "{:.3e}", lambda value: value > 0.0),
-    ("remoe_reg_loss", "rreg", "{:.3e}", lambda value: value > 0.0),
     ("discriminative_loss", "disc", "{:.3e}", lambda value: value != 0.0),
     ("evidential_sparsity_loss", "spar", "{:.3e}", lambda value: value > 0.0),
     ("evidence_calibration_loss", "cal", "{:.3e}", lambda value: value > 0.0),
+    (
+        "evidence_calibration_task_fit_loss",
+        "cal_fit",
+        "{:.3e}",
+        lambda value: value > 0.0,
+    ),
+    (
+        "evidence_calibration_seek_loss",
+        "cal_seek",
+        "{:.3e}",
+        lambda value: value > 0.0,
+    ),
     ("ortho_loss", "ortho", "{:.3e}", lambda value: value > 0.0),
 ]
 
@@ -47,7 +66,6 @@ _EPOCH_EUGE_SPECS = [
     ("exploration_frac", "exp", "{:.6f}"),
     ("top_evidence", "etop", "{:.6f}"),
     ("tail_evidence", "etail", "{:.6f}"),
-    ("tail_ratio", "tailr", "{:.6f}"),
 ]
 
 
@@ -70,12 +88,6 @@ def accumulate_scalar_stats(accumulator: Dict[str, float], stats: Dict) -> None:
         if value is None or not isinstance(value, (int, float)):
             continue
         accumulator[key] = accumulator.get(key, 0.0) + float(value)
-
-
-def average_scalar_stats(accumulator: Dict[str, float], count: int) -> Dict[str, float]:
-    if count <= 0:
-        return {}
-    return {key: value / count for key, value in accumulator.items()}
 
 
 def build_train_postfix(
@@ -101,65 +113,20 @@ def build_train_postfix(
     _append_metric_if_present(
         postfix,
         expert_sparsity_stats,
-        "active_experts_per_token",
-        "aexp",
+        "active_experts_per_token_0",
+        "a0",
         "{:.2f}",
         lambda _: True,
     )
     _append_metric_if_present(
         postfix,
         expert_sparsity_stats,
-        "routing_sparsity",
-        "rspar",
-        "{:.3f}",
-        lambda _: True,
-    )
-    _append_metric_if_present(
-        postfix,
-        aux_stats,
-        "dynmole_entropy_coef",
-        "dbeta",
-        "{:.2e}",
-        lambda _: True,
-    )
-    _append_metric_if_present(
-        postfix,
-        aux_stats,
-        "remoe_reg_coef",
-        "rl1",
-        "{:.2e}",
+        "active_experts_per_token_1e_3",
+        "a1e3",
+        "{:.2f}",
         lambda _: True,
     )
     return postfix
-
-
-def build_epoch_summary_suffix(
-    aux_stats: Dict,
-    euge_stats: Dict,
-    expert_sparsity_stats: Dict,
-) -> str:
-    parts = []
-    for source_key, label, fmt, predicate in _EPOCH_AUX_SPECS:
-        value = aux_stats.get(source_key)
-        if value is not None and predicate(value):
-            parts.append(f"{label} {fmt.format(value)}")
-    for source_key, label, fmt in _EPOCH_EUGE_SPECS:
-        value = euge_stats.get(source_key)
-        if value is not None:
-            parts.append(f"{label} {fmt.format(value)}")
-    value = expert_sparsity_stats.get("active_experts_per_token")
-    if value is not None:
-        parts.append(f"aexp {value:.6f}")
-    value = expert_sparsity_stats.get("routing_sparsity")
-    if value is not None:
-        parts.append(f"rspar {value:.6f}")
-    value = aux_stats.get("remoe_reg_coef")
-    if value is not None:
-        parts.append(f"rl1 {value:.3e}")
-    value = aux_stats.get("dynmole_entropy_coef")
-    if value is not None:
-        parts.append(f"dbeta {value:.3e}")
-    return "".join(f" | {part}" for part in parts)
 
 
 def build_lora_config(
@@ -168,27 +135,15 @@ def build_lora_config(
     target_modules: Dict,
     routing_strategy: str,
 ) -> MixLoraConfig:
-    default_router_bias_init = -0.02 if routing_strategy == "remoe" else 0.0
-    if routing_strategy == "dynmole":
-        load_balance_loss_coef = 0.0
-        discriminative_loss_coef = 0.0
-        evidential_sparsity_loss_coef = 0.0
-        evidence_calibration_loss_coef = 0.0
-        expert_ortho_loss_coef = 0.0
-        dynmole_entropy_loss_coef = 1e-2
-    else:
-        load_balance_loss_coef = float(cfg.get("load_balance_loss_coef", 0.0))
-        discriminative_loss_coef = float(cfg.get("discriminative_loss_coef", 0.0))
-        evidential_sparsity_loss_coef = float(
-            cfg.get("evidential_sparsity_loss_coef", 0.0)
-        )
-        evidence_calibration_loss_coef = float(
-            cfg.get("evidence_calibration_loss_coef", 0.0)
-        )
-        expert_ortho_loss_coef = float(cfg.get("expert_ortho_loss_coef", 0.0))
-        dynmole_entropy_loss_coef = float(
-            cfg.get("dynmole_entropy_loss_coef", 1e-2)
-        )
+    load_balance_loss_coef = float(cfg.get("load_balance_loss_coef", 0.0))
+    discriminative_loss_coef = float(cfg.get("discriminative_loss_coef", 0.0))
+    evidential_sparsity_loss_coef = float(
+        cfg.get("evidential_sparsity_loss_coef", 0.0)
+    )
+    evidence_calibration_loss_coef = float(
+        cfg.get("evidence_calibration_loss_coef", 0.0)
+    )
+    expert_ortho_loss_coef = float(cfg.get("expert_ortho_loss_coef", 0.0))
 
     return MixLoraConfig(
         base_model_=cfg["base_model"],
@@ -204,25 +159,16 @@ def build_lora_config(
         num_experts_=int(cfg.get("num_experts", 8)),
         top_k_=int(cfg.get("top_k", 2)),
         routing_strategy_=routing_strategy,
+        inference_mode_=str(cfg.get("inference", "dense")),
         load_balance_loss_coef_=load_balance_loss_coef,
         discriminative_loss_coef_=discriminative_loss_coef,
         evidential_sparsity_loss_coef_=evidential_sparsity_loss_coef,
         evidence_calibration_loss_coef_=evidence_calibration_loss_coef,
         expert_ortho_loss_coef_=expert_ortho_loss_coef,
         router_init_range_=float(cfg.get("router_init_range", 0.02)),
-        router_bias_init_=float(cfg.get("router_bias_init", default_router_bias_init)),
+        router_bias_init_=float(cfg.get("router_bias_init", 0.0)),
         u_threshold_=float(cfg.get("u_threshold", 0.1)),
-        dynmole_top_p_=float(cfg.get("dynmole_top_p", 0.75)),
-        dynmole_entropy_threshold_=float(cfg.get("dynmole_entropy_threshold", 0.9)),
-        dynmole_entropy_index_=float(cfg.get("dynmole_entropy_index", 1.1)),
-        dynmole_entropy_loss_coef_=dynmole_entropy_loss_coef,
-        remoe_reg_init_=float(cfg.get("remoe_reg_init", 1e-8)),
-        remoe_reg_update_mul_=float(cfg.get("remoe_reg_update_mul", 1.2)),
-        remoe_target_sparsity_=(
-            None
-            if cfg.get("remoe_target_sparsity") is None
-            else float(cfg.get("remoe_target_sparsity"))
-        ),
+        loss_free_bias_update_rate_=float(cfg.get("loss_free_bias_update_rate", 1e-3)),
     )
 
 
@@ -239,13 +185,12 @@ def resolve_loss_runtime(cfg: dict, lora_cfg: MixLoraConfig) -> Dict:
         "evidence_loss_max": cfg.get("loss_max", 3.0),
         "router_bias_init": lora_cfg.router_bias_init_,
         "u_threshold": cfg.get("u_threshold", 0.1),
-        "dynmole_top_p": lora_cfg.dynmole_top_p_,
-        "dynmole_entropy_threshold": lora_cfg.dynmole_entropy_threshold_,
-        "dynmole_entropy_index": lora_cfg.dynmole_entropy_index_,
-        "dynmole_entropy_loss_coef": lora_cfg.dynmole_entropy_loss_coef_,
-        "remoe_reg_coef": lora_cfg.remoe_reg_init_,
-        "remoe_reg_update_mul": lora_cfg.remoe_reg_update_mul_,
-        "remoe_target_sparsity": lora_cfg.remoe_target_sparsity_,
+        "loss_free_bias_update_rate": lora_cfg.loss_free_bias_update_rate_,
+        "discriminative_target_magnitude": float(
+            cfg.get("discriminative_target_magnitude", 1e-2)
+        ),
+        "ortho_target_magnitude": float(cfg.get("ortho_target_magnitude", 1e-4)),
+        "loss_scale_eps": float(cfg.get("loss_scale_eps", 1e-12)),
     }
 
 
@@ -383,7 +328,6 @@ def build_experiment_dirname(cfg: dict) -> str:
 
     loss_name_map = [
         ("lb", "load_balance_loss_coef"),
-        ("dent", "dynmole_entropy_loss_coef"),
         ("disc", "discriminative_loss_coef"),
         ("spar", "evidential_sparsity_loss_coef"),
         ("cal", "evidence_calibration_loss_coef"),
@@ -420,6 +364,20 @@ def _compute_accuracy_stats(values: List[float]) -> Dict[str, float]:
     }
 
 
+def _compute_optional_metric_stats(
+    entries: List[Dict],
+    source_key: str,
+) -> Dict[str, float]:
+    values = [
+        float(entry[source_key])
+        for entry in entries
+        if entry.get(source_key) is not None
+    ]
+    if not values:
+        return {}
+    return _compute_accuracy_stats(values)
+
+
 def aggregate_multi_seed_results(run_summaries: List[Dict]) -> Dict:
     aggregated: Dict = {}
     benchmark_order: List[str] = []
@@ -434,6 +392,8 @@ def aggregate_multi_seed_results(run_summaries: List[Dict]) -> Dict:
                 {
                     "seed": summary["seed"],
                     "accuracy": result["accuracy"],
+                    "aexp": result.get("active_experts_per_token_0"),
+                    "aexp1e3": result.get("active_experts_per_token_1e_3"),
                     "output_dir": summary["output_dir"],
                 }
             )
@@ -447,6 +407,8 @@ def aggregate_multi_seed_results(run_summaries: List[Dict]) -> Dict:
         values = [entry["accuracy"] for entry in entries]
         metrics[name] = {
             **_compute_accuracy_stats(values),
+            "aexp": _compute_optional_metric_stats(entries, "aexp"),
+            "aexp1e3": _compute_optional_metric_stats(entries, "aexp1e3"),
             "values": entries,
         }
 

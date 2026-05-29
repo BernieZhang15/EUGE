@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +9,21 @@ from .loss_utils import (
     _flatten_attention_mask,
     _flatten_router_logits,
     _truncated_exploration_coeff,
+    build_euge_intermediates,
 )
+
+
+def _apply_flattened_selection(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    if tensor.ndim == 0:
+        return tensor
+    if mask.numel() != tensor.shape[0]:
+        raise ValueError(
+            f"mask has {mask.numel()} entries, but tensor has {tensor.shape[0]} token rows."
+        )
+    return tensor[mask]
 
 
 def topk_load_balancing_loss(
@@ -18,6 +32,7 @@ def topk_load_balancing_loss(
     top_k: int,
     coef: float = 1.0,
     attention_mask: Optional[torch.Tensor] = None,
+    flat_attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Switch-style top-k load balancing loss.
@@ -33,7 +48,10 @@ def topk_load_balancing_loss(
         return router_logits.new_zeros(())
 
     router_logits = _flatten_router_logits(router_logits, num_experts)
-    router_logits = _apply_attention_mask(router_logits, attention_mask)
+    if flat_attention_mask is not None:
+        router_logits = _apply_flattened_selection(router_logits, flat_attention_mask)
+    else:
+        router_logits = _apply_attention_mask(router_logits, attention_mask)
 
     if router_logits.numel() == 0:
         return router_logits.new_zeros(())
@@ -50,9 +68,11 @@ def topk_load_balancing_loss(
     return coef * loss
 
 def discriminative_routing_loss(
-    routing_weights: torch.Tensor,
+    routing_weights: Optional[torch.Tensor] = None,
+    router_scores: Optional[torch.Tensor] = None,
     coef: float = 1.0,
     attention_mask: Optional[torch.Tensor] = None,
+    flat_attention_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Variance-based router loss aligned with the released implementation of
@@ -67,18 +87,24 @@ def discriminative_routing_loss(
     evidence-based routing. The key requirement is that they represent the
     per-token expert weight vector after routing.
     """
+    source = router_scores if router_scores is not None else routing_weights
+    if source is None:
+        raise ValueError("discriminative_routing_loss requires routing_weights or router_scores.")
     if coef == 0.0:
-        return routing_weights.new_zeros(())
+        return source.new_zeros(())
 
-    num_experts = routing_weights.shape[-1]
-    routing_weights = _flatten_router_logits(routing_weights, num_experts)
-    routing_weights = _apply_attention_mask(routing_weights, attention_mask)
+    num_experts = source.shape[-1]
+    source = _flatten_router_logits(source, num_experts)
+    if flat_attention_mask is not None:
+        source = _apply_flattened_selection(source, flat_attention_mask)
+    else:
+        source = _apply_attention_mask(source, attention_mask)
 
-    if routing_weights.numel() == 0:
-        return routing_weights.new_zeros(())
+    if source.numel() == 0:
+        return source.new_zeros(())
 
-    routing_weights = routing_weights.float()
-    variance = torch.var(routing_weights, dim=-1).mean()
+    source = source.float()
+    variance = torch.var(source, dim=-1).mean()
     return -coef * variance
 
 
@@ -137,174 +163,56 @@ def expert_output_orthogonality_loss(
         return expert_outputs.new_zeros(())
 
     expert_outputs = expert_outputs.float()
-    reference = expert_outputs[:, None, :, :]
-    current = expert_outputs[:, :, None, :]
-
-    dot = (current * reference).sum(dim=-1)
-    reference_norm_sq = reference.square().sum(dim=-1)
-
-    projection_norm_sq = dot.square() * reference_norm_sq / reference_norm_sq.add(1e-6).square()
-
-    pair_mask = (
-        active_mask[:, :, None]
-        & active_mask[:, None, :]
-        & ~torch.eye(num_experts, device=expert_outputs.device, dtype=torch.bool).unsqueeze(0)
-    )
-    active_pair_count = pair_mask.sum()
-    if active_pair_count.item() == 0:
-        return expert_outputs.new_zeros(())
-
-    total_loss = projection_norm_sq.masked_select(pair_mask).sum()
-    total_loss = total_loss / active_pair_count.to(dtype=expert_outputs.dtype)
-
-    return coef * total_loss
-
-
-def _build_compact_outputs_for_selected_experts(
-    selected_experts: torch.Tensor,
-    num_experts: int,
-    dtype: torch.dtype,
-    expert_token_indices: List[torch.Tensor],
-    expert_states: List[torch.Tensor],
-    hidden_states: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = hidden_states.shape[0]
-    hidden_dim = hidden_states.shape[1]
-    max_active_experts = selected_experts.shape[-1]
-
-    compact_outputs = torch.zeros(
-        (num_tokens, max_active_experts, hidden_dim),
-        dtype=dtype,
-        device=hidden_states.device,
-    )
-    compact_active_mask = torch.ones(
-        (num_tokens, max_active_experts),
-        dtype=torch.bool,
-        device=hidden_states.device,
-    )
-
-    for expert_idx in range(num_experts):
-        top_x = expert_token_indices[expert_idx]
-        if top_x.numel() == 0:
-            continue
-
-        token_positions, slot_positions = torch.where(selected_experts == expert_idx)
-        if token_positions.numel() == 0:
-            continue
-
-        if top_x.numel() == num_tokens:
-            compact_outputs[token_positions, slot_positions] = expert_states[expert_idx][
-                token_positions
-            ]
-            continue
-
-        token_to_local = torch.full(
-            (num_tokens,),
-            -1,
-            dtype=torch.long,
-            device=hidden_states.device,
-        )
-        token_to_local[top_x] = torch.arange(
-            top_x.numel(),
-            device=hidden_states.device,
-        )
-        local_positions = token_to_local[token_positions]
-        valid_positions = local_positions >= 0
-        if not valid_positions.any():
-            continue
-
-        compact_outputs[
-            token_positions[valid_positions],
-            slot_positions[valid_positions],
-        ] = expert_states[expert_idx][local_positions[valid_positions]]
-
-    return compact_outputs, compact_active_mask
-
-
-def _build_compact_outputs_from_active_mask(
-    routing_weights: torch.Tensor,
-    dtype: torch.dtype,
-    expert_token_indices: List[torch.Tensor],
-    expert_states: List[torch.Tensor],
-    hidden_states: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = hidden_states.shape[0]
-    hidden_dim = hidden_states.shape[1]
-    active_mask = routing_weights > 0
     active_counts = active_mask.sum(dim=-1)
-    max_active_experts = int(active_counts.max().item())
-    active_slots = active_mask.long().cumsum(dim=-1) - 1
 
-    compact_outputs = torch.zeros(
-        (num_tokens, max_active_experts, hidden_dim),
-        dtype=dtype,
-        device=hidden_states.device,
-    )
-    compact_active_mask = torch.zeros(
-        (num_tokens, max_active_experts),
-        dtype=torch.bool,
-        device=hidden_states.device,
-    )
+    # Fast path for the common top-k=2 case. This is algebraically identical
+    # to the repo's Gram-Schmidt procedure because each expert is projected
+    # onto the 1D subspace spanned by the other expert.
+    if expert_outputs.shape[1] == 2 and torch.all(active_counts == 2):
+        first = expert_outputs[:, 0, :]
+        second = expert_outputs[:, 1, :]
+        dot = (first * second).sum(dim=-1)
+        first_norm_sq = first.square().sum(dim=-1) + 1e-6
+        second_norm_sq = second.square().sum(dim=-1) + 1e-6
+        per_token_loss = 0.5 * dot.square() * (
+            first_norm_sq.reciprocal() + second_norm_sq.reciprocal()
+        )
+        return coef * per_token_loss.mean()
 
-    for expert_idx, top_x in enumerate(expert_token_indices):
-        if top_x.numel() == 0:
+    total_loss = expert_outputs.new_zeros(())
+    total_count = 0
+    for token_idx in range(expert_outputs.shape[0]):
+        if active_counts[token_idx].item() <= 1:
             continue
-        slot_x = active_slots[top_x, expert_idx]
-        compact_outputs[top_x, slot_x] = expert_states[expert_idx]
-        compact_active_mask[top_x, slot_x] = True
+        token_active = active_mask[token_idx]
+        active_indices = torch.nonzero(token_active, as_tuple=False).flatten()
+        token_outputs = expert_outputs[token_idx, active_indices]
+        num_active = token_outputs.shape[0]
+        for current_idx in range(num_active):
+            other_experts = torch.cat(
+                (token_outputs[:current_idx], token_outputs[current_idx + 1 :]),
+                dim=0,
+            )
+            basis = []
+            for other_idx in range(other_experts.shape[0]):
+                vec = other_experts[other_idx]
+                for basis_vec in basis:
+                    vec = vec - (basis_vec * vec).sum() * basis_vec
+                vec_norm = torch.norm(vec)
+                if vec_norm.item() > 1e-6:
+                    basis.append(vec / (vec_norm + 1e-6))
 
-    return compact_outputs, compact_active_mask
+            current_expert = token_outputs[current_idx]
+            proj_loss = expert_outputs.new_zeros(())
+            for basis_vec in basis:
+                proj = (basis_vec * current_expert).sum() * basis_vec
+                proj_loss = proj_loss + torch.sum(proj.square())
+            total_loss = total_loss + proj_loss
+            total_count += 1
 
-
-def compute_moe_ortho_loss(
-    training: bool,
-    routing_strategy: str,
-    coef: float,
-    selected_experts: Optional[torch.Tensor],
-    num_experts: int,
-    dtype: torch.dtype,
-    expert_token_indices: List[torch.Tensor],
-    routing_weights: torch.Tensor,
-    expert_states: List[torch.Tensor],
-    hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    if not training or coef <= 0.0 or routing_strategy == "remoe":
-        return hidden_states.new_zeros(())
-
-    if routing_strategy == "EUGE":
-        if selected_experts is None or selected_experts.numel() == 0:
-            return hidden_states.new_zeros(())
-        max_active_experts = selected_experts.shape[-1]
-        if max_active_experts <= 1:
-            return hidden_states.new_zeros(())
-        compact_outputs, compact_active_mask = _build_compact_outputs_for_selected_experts(
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            dtype=dtype,
-            expert_token_indices=expert_token_indices,
-            expert_states=expert_states,
-            hidden_states=hidden_states,
-        )
-    else:
-        active_counts = (routing_weights > 0).sum(dim=-1)
-        if active_counts.numel() == 0:
-            return hidden_states.new_zeros(())
-        max_active_experts = int(active_counts.max().item())
-        if max_active_experts <= 1:
-            return hidden_states.new_zeros(())
-        compact_outputs, compact_active_mask = _build_compact_outputs_from_active_mask(
-            routing_weights=routing_weights,
-            dtype=dtype,
-            expert_token_indices=expert_token_indices,
-            expert_states=expert_states,
-            hidden_states=hidden_states,
-        )
-
-    return expert_output_orthogonality_loss(
-        compact_outputs,
-        active_mask=compact_active_mask,
-        coef=coef,
-    )
+    if total_count == 0:
+        return expert_outputs.new_zeros(())
+    return coef * (total_loss / float(total_count))
 
 
 def evidential_sparsity_loss(
@@ -314,6 +222,9 @@ def evidential_sparsity_loss(
     lambda_sparse: float = 1.0,
     attention_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
+    evidence: Optional[torch.Tensor] = None,
+    selected_experts: Optional[torch.Tensor] = None,
+    exploration_coeff: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Evidential sparsity loss for uncertainty-guided evidential routing.
@@ -337,8 +248,29 @@ def evidential_sparsity_loss(
     if router_logits.numel() == 0:
         return router_logits.new_zeros(())
 
-    e = torch.relu(router_logits.float())
-    topk_idx = torch.topk(e.detach(), k=top_k, dim=-1).indices
+    if (
+        evidence is None
+        or selected_experts is None
+        or exploration_coeff is None
+    ):
+        intermediates = build_euge_intermediates(
+            router_logits=router_logits,
+            top_k=top_k,
+            num_experts=num_experts,
+            u_threshold=u_threshold,
+            eps=eps,
+        )
+        e = intermediates.evidence
+        topk_idx = intermediates.selected_experts
+        rho = intermediates.exploration_coeff.reshape(-1)
+    else:
+        e = _apply_attention_mask(evidence, attention_mask).float()
+        topk_idx = _apply_attention_mask(selected_experts, attention_mask)
+        flat_attention_mask = _flatten_attention_mask(attention_mask, e.device)
+        if flat_attention_mask is None:
+            rho = exploration_coeff.reshape(-1)
+        else:
+            rho = _apply_flattened_selection(exploration_coeff, flat_attention_mask)
 
     mask = torch.zeros_like(e)
     mask.scatter_(-1, topk_idx, 1.0)
@@ -360,9 +292,6 @@ def evidential_sparsity_loss(
 
     kl = (log_B_alpha + log_B_ones + correction).squeeze(-1)
 
-    evidence_sum = e.sum(dim=-1)
-    uncertainty = num_experts / (num_experts + evidence_sum + eps)
-    rho = _truncated_exploration_coeff(uncertainty, u_threshold, eps).detach()
     loss_per_token = (1.0 - rho) * kl
 
     return lambda_sparse * loss_per_token.mean()
@@ -380,7 +309,11 @@ def evidence_calibration_loss(
     task_loss_per_token: Optional[torch.Tensor] = None,
     loss_min: float = 0.0,
     loss_max: float = 3.0,
-) -> torch.Tensor:
+    evidence: Optional[torch.Tensor] = None,
+    top_evidence: Optional[torch.Tensor] = None,
+    tail_evidence: Optional[torch.Tensor] = None,
+    exploration_coeff: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Evidence calibration loss for an evidential MoE router.
 
@@ -394,7 +327,8 @@ def evidence_calibration_loss(
       - rho is the detached exploration coefficient
     """
     if coef == 0.0:
-        return router_logits.new_zeros(())
+        zero = router_logits.new_zeros(())
+        return zero, zero, zero
     if top_k is None:
         raise ValueError("evidence_calibration_loss requires top_k.")
 
@@ -450,26 +384,43 @@ def evidence_calibration_loss(
     task_loss = task_loss[combined_mask]
 
     if router_logits.numel() == 0:
-        return router_logits.new_zeros(())
+        zero = router_logits.new_zeros(())
+        return zero, zero, zero
 
-    e = torch.relu(router_logits.float())
-    all_evidence = e.sum(dim=-1)
+    if (
+        evidence is None
+        or top_evidence is None
+        or tail_evidence is None
+        or exploration_coeff is None
+    ):
+        intermediates = build_euge_intermediates(
+            router_logits=router_logits,
+            top_k=top_k,
+            num_experts=num_experts,
+            u_threshold=u_threshold,
+            eps=eps,
+        )
+        e = intermediates.evidence
+        all_evidence = intermediates.evidence_sum.squeeze(-1)
+        top_evidence = intermediates.top_evidence
+        tail_evidence = intermediates.tail_evidence
+        rho = intermediates.exploration_coeff.reshape(-1)
+    else:
+        e = evidence[combined_mask].float()
+        all_evidence = e.sum(dim=-1)
+        top_evidence = _apply_flattened_selection(top_evidence, combined_mask)
+        tail_evidence = _apply_flattened_selection(tail_evidence, combined_mask)
+        rho = _apply_flattened_selection(exploration_coeff.reshape(-1), combined_mask)
+
     total_strength = float(num_experts) + all_evidence
-
-    topk_idx = torch.topk(e.detach(), k=top_k, dim=-1).indices
-    top_mask = torch.zeros_like(e)
-    top_mask.scatter_(-1, topk_idx, 1.0)
-    top_evidence = (e * top_mask).sum(dim=-1)
-    tail_evidence = all_evidence - top_evidence
-
-    uncertainty = float(num_experts) / (float(num_experts) + all_evidence + eps)
-    rho = _truncated_exploration_coeff(uncertainty, u_threshold, eps).detach()
     seek_strength = float(num_experts) + top_evidence + rho * tail_evidence
 
     clipped_task_loss = task_loss.detach().float().clamp(min=loss_min, max=loss_max)
-    loss_per_token = (
-        clipped_task_loss * torch.log(total_strength + eps)
-        + eta * float(num_experts) / (seek_strength + eps)
-    )
+    task_fit_term = clipped_task_loss * torch.log(total_strength + eps)
+    seek_term = eta * float(num_experts) / (seek_strength + eps)
 
-    return coef * loss_per_token.mean()
+    task_fit_loss = coef * task_fit_term.mean()
+    seek_loss = coef * seek_term.mean()
+    total_loss = task_fit_loss + seek_loss
+
+    return total_loss, task_fit_loss, seek_loss

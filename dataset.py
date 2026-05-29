@@ -23,7 +23,10 @@ logger = logging.getLogger(__name__)
 COMMONSENSE_DATASET_CANDIDATES = {
     "arc_c": [("allenai/ai2_arc", "ARC-Challenge")],
     "arc_e": [("allenai/ai2_arc", "ARC-Easy")],
-    "boolq": [("google/boolq", None)],
+    "boolq": [
+        ("google/boolq", None),
+        ("super_glue", "boolq"),
+    ],
     "obqa": [("allenai/openbookqa", "main")],
     "piqa": [("1-800-LLMs/piqa", None)],
     "siqa": [("baber/social_i_qa", None)],
@@ -234,32 +237,17 @@ class _TokenizedCommonsenseDataset(torch.utils.data.Dataset):
         self.input_ids = []
         self.attention_mask = []
 
-        total = len(raw_ds)
         pending_texts = []
-        valid_examples = 0
 
-        for raw_index, ex in enumerate(raw_ds, start=1):
+        for ex in raw_ds:
             result = format_commonsense_example(dataset_name, ex)
             if result is None:
                 continue
             pending_texts.append(result["prompt"] + " " + result["response"])
-            valid_examples += 1
 
             if len(pending_texts) >= tokenize_batch_size:
                 self._tokenize_chunk(tokenizer, max_length, pending_texts)
                 pending_texts.clear()
-
-            if (
-                raw_index == 1
-                or raw_index == total
-                or ((raw_index - 1) // tokenize_batch_size) % 50 == 0
-            ):
-                logger.info(
-                    "    scanned %s/%s | valid %s",
-                    raw_index,
-                    total,
-                    valid_examples,
-                )
 
         if pending_texts:
             self._tokenize_chunk(tokenizer, max_length, pending_texts)

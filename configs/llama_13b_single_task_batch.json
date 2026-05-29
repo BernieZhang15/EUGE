@@ -1,11 +1,11 @@
 {
-  "base_model": "/home/test/boning/models/Qwen2.5-7B",
-  "device": "cuda:0",
-  "datasets": ["arc_c"],
+  "base_model": "/home/test/boning/models/Llama-2-13b-hf",
+  "device": "cuda:1",
+  "datasets": ["siqa", "piqa"],
   "single_task_batch": true,
-  "output_dir": "./outputs/qwen_7b",
+  "output_dir": "./outputs/llama_13b",
   "routing_strategy": "EUGE",
-  "inference": "sparse",
+  "inference": "dense",
 
   "num_experts": 8,
   "top_k": 2,
@@ -16,19 +16,19 @@
 
   "load_balance_loss_coef": 0.0,
   "discriminative_loss_coef": 0.0,
-  "evidential_sparsity_loss_coef": 0.05,
-  "evidence_calibration_loss_coef": 0.04,
-  "expert_ortho_loss_coef": 0.0,
+  "evidential_sparsity_loss_coef": 0.03,
+  "evidence_calibration_loss_coef": 0.03,
+  "expert_ortho_loss_coef": 0.001,
 
   "loss_free_bias_update_rate": 0.001,
   "discriminative_target_magnitude": 0.01,
   "ortho_target_magnitude": 0.0001,
   "loss_scale_eps": 1e-12,
 
-  "eta": 5.0,
+  "eta": 4.0,
+  "u_threshold": 0.75,
   "loss_min": 0.15,
   "loss_max": 3.0,
-  "u_threshold": 0.75,
   "sparsity_loss_eps": 1e-8,
 
   "router_init_range": 0.02,
@@ -38,10 +38,10 @@
   "batch_size": 4,
   "gradient_accumulation_steps": 4,
   "learning_rate": 2e-4,
-  "weight_decay": 0.0,
+  "weight_decay": 0.01,
   "max_grad_norm": null,
   "max_length": 512,
 
   "eval_batch_size": 16,
-  "seeds": [43, 123, 3407]
+  "seeds": [42, 123, 3407]
 }
